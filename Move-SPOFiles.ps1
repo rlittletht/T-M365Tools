@@ -1,7 +1,24 @@
 <#
 .SYNOPSIS
-    Moves files in a SharePoint Online site using PnP.PowerShell.
+    Moves files in a SharePoint Online site using PnP.PowerShell. when a file is moved in a document
+    library, if there is an associated file in the PDF subdirectory, then that file will also be
+    moved into the corresponding PDF subdirectory in the destination.
 
+    For example:
+
+    source/folder/PDF/MyFile.pdf
+    source/folder/MyFile.docx
+
+    if you ask to move source/folder/MyFile.docx to target/newfolder/MyFile.docx, then the script
+    will first check for PDF/MyFile.pdf. If it exists, then target/newfolder/PDF will be created
+    (if it doesn't already exist), and then source/folder/PDF/MyFile.pdf will be moved to target/newfolder/PDF/MyFile.pdf.
+
+    This is done in order to preserve the association between the original file and its PDF version, which is important
+    sharing links and other functionality that relies on the PDF being in a predictable location relative to the original file
+
+    If you ask to move a source pattern (like source/folder/*Training*.docx), then the script will get each file that matches
+    the pattern and then do the move for each file, including checking for the associated PDF in the PDF subdirectory and moving it if it exists.
+    
 .DESCRIPTION
     This script helps move files within a SharePoint Online site. It includes checks to ensure
     PnP.PowerShell is installed and that you're connected to a SharePoint site.
