@@ -18,7 +18,7 @@
 
     If you ask to move a source pattern (like source/folder/*Training*.docx), then the script will get each file that matches
     the pattern and then do the move for each file, including checking for the associated PDF in the PDF subdirectory and moving it if it exists.
-    
+
 .DESCRIPTION
     This script helps move files within a SharePoint Online site. It includes checks to ensure
     PnP.PowerShell is installed and that you're connected to a SharePoint site.
@@ -29,6 +29,13 @@
 .PARAMETER Connect
     Connects to a SharePoint site using the specified URL.
 
+.PARAMETER MoveFile
+    The source file or pattern to move. Can be a single file path or a wildcard pattern.
+    Examples: "Shared Documents/file.docx" or "Shared Documents/*Training*.docx"
+
+.PARAMETER Destination
+    The destination folder path where the file(s) will be moved. Required when -MoveFile is specified.
+
 .EXAMPLE
     .\Move-SPOFiles.ps1 -Check
     Checks if PnP.PowerShell is installed and if connected to a SharePoint site.
@@ -36,6 +43,14 @@
 .EXAMPLE
     .\Move-SPOFiles.ps1 -Connect "https://contoso.sharepoint.com/sites/ProjectSite"
     Connects to the specified SharePoint site using interactive authentication.
+
+.EXAMPLE
+    .\Move-SPOFiles.ps1 -MoveFile "Shared Documents/MyFile.docx" -Destination "Shared Documents/Archive"
+    Moves MyFile.docx to the Archive folder, including any associated PDF file.
+
+.EXAMPLE
+    .\Move-SPOFiles.ps1 -MoveFile "Shared Documents/*Training*.docx" -Destination "Shared Documents/Training"
+    Moves all files matching the pattern to the Training folder, including associated PDFs.
 
 .NOTES
     Author: Created for M365 Tools
@@ -49,7 +64,13 @@ param(
     [switch]$Check,
     
     [Parameter(Mandatory=$false)]
-    [string]$Connect
+    [string]$Connect,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$MoveFile,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$Destination
 )
 
 function Test-PnPModule {
@@ -264,6 +285,194 @@ function Invoke-EnvironmentCheck {
     }
 }
 
+function Move-SPOFileWithPDF {
+    <#
+    .SYNOPSIS
+        Moves a file and its associated PDF if it exists.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [Microsoft.SharePoint.Client.File]$File,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$DestinationFolder
+    )
+    
+    try {
+        $fileName = $File.Name
+        $fileServerRelativeUrl = $File.ServerRelativeUrl
+        $fileFolder = $File.ServerRelativeUrl.Substring(0, $File.ServerRelativeUrl.LastIndexOf('/'))
+        
+        # Get the base name without extension
+        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
+        $extension = [System.IO.Path]::GetExtension($fileName)
+        
+        Write-Host "  Processing: $fileName" -ForegroundColor Cyan
+        
+        # Check for associated PDF file
+        $pdfPath = "$fileFolder/PDF/$baseName.pdf"
+        $hasPDF = $false
+        
+        try {
+            $pdfFile = Get-PnPFile -Url $pdfPath -ErrorAction SilentlyContinue
+            if ($null -ne $pdfFile) {
+                $hasPDF = $true
+                Write-Host "    [✓] Found associated PDF: $pdfPath" -ForegroundColor Gray
+            }
+        }
+        catch {
+            # PDF doesn't exist, that's okay
+        }
+        
+        # Move the PDF first if it exists
+        if ($hasPDF) {
+            $pdfDestFolder = "$DestinationFolder/PDF"
+            
+            # Ensure PDF destination folder exists
+            try {
+                $pdfFolder = Get-PnPFolder -Url $pdfDestFolder -ErrorAction SilentlyContinue
+                if ($null -eq $pdfFolder) {
+                    Write-Host "    [!] Creating PDF subfolder: $pdfDestFolder" -ForegroundColor Yellow
+                    $null = Add-PnPFolder -Name "PDF" -Folder $DestinationFolder -ErrorAction Stop
+                }
+            }
+            catch {
+                Write-Host "    [!] Creating destination folder structure" -ForegroundColor Yellow
+                # May need to create parent folders
+                $null = Resolve-PnPFolder -SiteRelativePath $pdfDestFolder
+            }
+            
+            # Move the PDF
+            Write-Host "    [→] Moving PDF to: $pdfDestFolder/$baseName.pdf" -ForegroundColor Gray
+            Move-PnPFile -SourceUrl $pdfPath -TargetUrl "$pdfDestFolder/$baseName.pdf" -Force -ErrorAction Stop
+            Write-Host "    [✓] PDF moved successfully" -ForegroundColor Green
+        }
+        
+        # Move the main file
+        $targetUrl = "$DestinationFolder/$fileName"
+        Write-Host "    [→] Moving file to: $targetUrl" -ForegroundColor Gray
+        Move-PnPFile -SourceUrl $fileServerRelativeUrl -TargetUrl $targetUrl -Force -ErrorAction Stop
+        Write-Host "    [✓] File moved successfully" -ForegroundColor Green
+        
+        return $true
+    }
+    catch {
+        Write-Host "    [X] Error moving file: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+}
+
+function Invoke-MoveFiles {
+    <#
+    .SYNOPSIS
+        Processes file move operations based on source pattern.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$SourcePattern,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$DestinationFolder
+    )
+    
+    Write-Host "\n=== Moving Files ==="  -ForegroundColor Cyan
+    Write-Host "Source: $SourcePattern" -ForegroundColor Gray
+    Write-Host "Destination: $DestinationFolder" -ForegroundColor Gray
+    
+    # Ensure we're connected
+    try {
+        $connection = Get-PnPConnection -ErrorAction Stop
+        if ($null -eq $connection) {
+            Write-Host "\n[X] Not connected to SharePoint. Use -Connect first." -ForegroundColor Red
+            return $false
+        }
+    }
+    catch {
+        Write-Host "\n[X] Not connected to SharePoint. Use -Connect first." -ForegroundColor Red
+        return $false
+    }
+    
+    # Ensure destination folder exists
+    try {
+        $destFolder = Get-PnPFolder -Url $DestinationFolder -ErrorAction SilentlyContinue
+        if ($null -eq $destFolder) {
+            Write-Host "\n[!] Destination folder doesn't exist. Creating: $DestinationFolder" -ForegroundColor Yellow
+            $null = Resolve-PnPFolder -SiteRelativePath $DestinationFolder
+        }
+    }
+    catch {
+        Write-Host "\n[X] Failed to create destination folder: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+    
+    # Check if source is a pattern or single file
+    if ($SourcePattern -match '\*') {
+        # Pattern - get matching files
+        $folderPath = $SourcePattern.Substring(0, $SourcePattern.LastIndexOf('/'))
+        $filePattern = $SourcePattern.Substring($SourcePattern.LastIndexOf('/') + 1)
+        
+        Write-Host "\nSearching for files matching pattern in: $folderPath" -ForegroundColor Yellow
+        
+        try {
+            $files = Get-PnPFolderItem -FolderSiteRelativeUrl $folderPath -ItemType File -ErrorAction Stop | 
+                     Where-Object { $_.Name -like $filePattern }
+            
+            if ($files.Count -eq 0) {
+                Write-Host "\n[!] No files found matching pattern: $filePattern" -ForegroundColor Yellow
+                return $false
+            }
+            
+            Write-Host "\nFound $($files.Count) file(s) to move\n" -ForegroundColor Green
+            
+            $successCount = 0
+            $failCount = 0
+            
+            foreach ($file in $files) {
+                if (Move-SPOFileWithPDF -File $file -DestinationFolder $DestinationFolder) {
+                    $successCount++
+                }
+                else {
+                    $failCount++
+                }
+                Write-Host ""
+            }
+            
+            Write-Host "=== Summary ===" -ForegroundColor Cyan
+            Write-Host "[✓] Successfully moved: $successCount file(s)" -ForegroundColor Green
+            if ($failCount -gt 0) {
+                Write-Host "[X] Failed to move: $failCount file(s)" -ForegroundColor Red
+            }
+            
+            return ($failCount -eq 0)
+        }
+        catch {
+            Write-Host "\n[X] Error searching for files: $($_.Exception.Message)" -ForegroundColor Red
+            return $false
+        }
+    }
+    else {
+        # Single file
+        try {
+            $file = Get-PnPFile -Url $SourcePattern -AsListItem -ErrorAction Stop
+            $fileObj = Get-PnPFile -Url $SourcePattern -ErrorAction Stop
+            
+            Write-Host ""
+            $result = Move-SPOFileWithPDF -File $fileObj -DestinationFolder $DestinationFolder
+            Write-Host ""
+            
+            if ($result) {
+                Write-Host "[✓] File move completed successfully" -ForegroundColor Green
+            }
+            
+            return $result
+        }
+        catch {
+            Write-Host "\n[X] File not found or error accessing file: $($_.Exception.Message)" -ForegroundColor Red
+            return $false
+        }
+    }
+}
+
 # Main script logic
 if ($Check) {
     $result = Invoke-EnvironmentCheck
@@ -293,11 +502,31 @@ elseif ($Connect) {
         exit 1
     }
 }
+elseif ($MoveFile) {
+    # Validate that Destination is provided
+    if ([string]::IsNullOrWhiteSpace($Destination)) {
+        Write-Host "[X] -Destination parameter is required when using -MoveFile" -ForegroundColor Red
+        Write-Host "\nUsage: .\Move-SPOFiles.ps1 -MoveFile '<source>' -Destination '<destination>'" -ForegroundColor Yellow
+        exit 1
+    }
+    
+    $result = Invoke-MoveFiles -SourcePattern $MoveFile -DestinationFolder $Destination
+    
+    if ($result) {
+        exit 0
+    }
+    else {
+        exit 1
+    }
+}
 else {
     Write-Host "No action specified. Available options:" -ForegroundColor Yellow
-    Write-Host "  -Check              Verify environment setup" -ForegroundColor Gray
-    Write-Host "  -Connect <url>      Connect to a SharePoint site" -ForegroundColor Gray
-    Write-Host "`nExamples:" -ForegroundColor Cyan
+    Write-Host "  -Check                    Verify environment setup" -ForegroundColor Gray
+    Write-Host "  -Connect <url>            Connect to a SharePoint site" -ForegroundColor Gray
+    Write-Host "  -MoveFile <src> -Destination <dest>   Move file(s) to destination" -ForegroundColor Gray
+    Write-Host "\nExamples:" -ForegroundColor Cyan
     Write-Host "  .\Move-SPOFiles.ps1 -Check" -ForegroundColor White
     Write-Host "  .\Move-SPOFiles.ps1 -Connect 'https://contoso.sharepoint.com/sites/ProjectSite'" -ForegroundColor White
+    Write-Host "  .\Move-SPOFiles.ps1 -MoveFile 'Shared Documents/file.docx' -Destination 'Shared Documents/Archive'" -ForegroundColor White
+    Write-Host "  .\Move-SPOFiles.ps1 -MoveFile 'Shared Documents/*Training*.docx' -Destination 'Shared Documents/Training'" -ForegroundColor White
 }
