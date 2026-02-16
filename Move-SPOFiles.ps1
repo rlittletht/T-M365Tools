@@ -34,11 +34,18 @@
     This parameter is processed first, allowing you to combine it with other actions like -Check or -MoveFile.
 
 .PARAMETER MoveFile
-    The source file or pattern to move. Can be a single file path or a wildcard pattern.
+    The source file or pattern to move. Must include the folder path.
     Examples: "Shared Documents/file.docx" or "Shared Documents/*Training*.docx"
 
 .PARAMETER Destination
     The destination folder path where the file(s) will be moved. Required when -MoveFile is specified.
+
+.PARAMETER ListFiles
+    Lists files matching the specified pattern without moving them. Must include the folder path.
+    Takes the source file or pattern (same format as -MoveFile). 
+    Examples: "Shared Documents/Rules*.*" or "Documents/Subfolder/*.docx"
+    If -Destination is specified, shows where files would be moved to.
+    If -Destination is omitted, simply lists the matching files.
 
 .EXAMPLE
     .\Move-SPOFiles.ps1 -Check
@@ -68,6 +75,14 @@
     .\Move-SPOFiles.ps1 -MoveFile "Shared Documents/*Training*.docx" -Destination "Shared Documents/Training"
     Moves all files matching the pattern to the Training folder, including associated PDFs.
 
+.EXAMPLE
+    .\Move-SPOFiles.ps1 -ListFiles "Shared Documents/*Training*.docx"
+    Lists all files matching the pattern.
+
+.EXAMPLE
+    .\Move-SPOFiles.ps1 -ListFiles "Shared Documents/*Training*.docx" -Destination "Shared Documents/Training"
+    Lists files that would be moved without actually moving them (dry run).
+
 .NOTES
     Author: Created for M365 Tools
     Date: February 16, 2026
@@ -86,7 +101,10 @@ param(
     [string]$MoveFile,
     
     [Parameter(Mandatory=$false)]
-    [string]$Destination
+    [string]$Destination,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$ListFiles
 )
 
 function Test-PnPModule {
@@ -311,7 +329,10 @@ function Move-SPOFileWithPDF {
         [Microsoft.SharePoint.Client.File]$File,
         
         [Parameter(Mandatory=$true)]
-        [string]$DestinationFolder
+        [string]$DestinationFolder,
+        
+        [Parameter(Mandatory=$false)]
+        [switch]$ListMode
     )
     
     try {
@@ -338,6 +359,17 @@ function Move-SPOFileWithPDF {
         }
         catch {
             # PDF doesn't exist, that's okay
+        }
+        
+        # If in list mode, just show what would be moved
+        if ($ListMode) {
+            if ($hasPDF) {
+                $pdfDestFolder = "$DestinationFolder/PDF"
+                Write-Host "    [→] Would move PDF to: $pdfDestFolder/$baseName.pdf" -ForegroundColor Blue
+            }
+            $targetUrl = "$DestinationFolder/$fileName"
+            Write-Host "    [→] Would move file to: $targetUrl" -ForegroundColor Blue
+            return $true
         }
         
         # Move the PDF first if it exists
@@ -387,13 +419,28 @@ function Invoke-MoveFiles {
         [Parameter(Mandatory=$true)]
         [string]$SourcePattern,
         
-        [Parameter(Mandatory=$true)]
-        [string]$DestinationFolder
+        [Parameter(Mandatory=$false)]
+        [string]$DestinationFolder,
+        
+        [Parameter(Mandatory=$false)]
+        [switch]$ListMode
     )
     
-    Write-Host "\n=== Moving Files ==="  -ForegroundColor Cyan
+    if ($ListMode) {
+        if ([string]::IsNullOrWhiteSpace($DestinationFolder)) {
+            Write-Host "\n=== Listing Files ===" -ForegroundColor Cyan
+        }
+        else {
+            Write-Host "\n=== Listing Files (Dry Run) ===" -ForegroundColor Cyan
+        }
+    }
+    else {
+        Write-Host "\n=== Moving Files ===" -ForegroundColor Cyan
+    }
     Write-Host "Source: $SourcePattern" -ForegroundColor Gray
-    Write-Host "Destination: $DestinationFolder" -ForegroundColor Gray
+    if (-not [string]::IsNullOrWhiteSpace($DestinationFolder)) {
+        Write-Host "Destination: $DestinationFolder" -ForegroundColor Gray
+    }
     
     # Ensure we're connected
     try {
@@ -408,22 +455,32 @@ function Invoke-MoveFiles {
         return $false
     }
     
-    # Ensure destination folder exists
-    try {
-        $destFolder = Get-PnPFolder -Url $DestinationFolder -ErrorAction SilentlyContinue
-        if ($null -eq $destFolder) {
-            Write-Host "\n[!] Destination folder doesn't exist. Creating: $DestinationFolder" -ForegroundColor Yellow
-            $null = Resolve-PnPFolder -SiteRelativePath $DestinationFolder
+    # Ensure destination folder exists (skip in list mode or if no destination specified)
+    if (-not $ListMode -and -not [string]::IsNullOrWhiteSpace($DestinationFolder)) {
+        try {
+            $destFolder = Get-PnPFolder -Url $DestinationFolder -ErrorAction SilentlyContinue
+            if ($null -eq $destFolder) {
+                Write-Host "\n[!] Destination folder doesn't exist. Creating: $DestinationFolder" -ForegroundColor Yellow
+                $null = Resolve-PnPFolder -SiteRelativePath $DestinationFolder
+            }
         }
-    }
-    catch {
-        Write-Host "\n[X] Failed to create destination folder: $($_.Exception.Message)" -ForegroundColor Red
-        return $false
+        catch {
+            Write-Host "\n[X] Failed to create destination folder: $($_.Exception.Message)" -ForegroundColor Red
+            return $false
+        }
     }
     
     # Check if source is a pattern or single file
     if ($SourcePattern -match '\*') {
         # Pattern - get matching files
+        # Validate that pattern includes a folder path
+        if ($SourcePattern -notmatch '/') {
+            Write-Host "\n[X] Pattern must include a folder path." -ForegroundColor Red
+            Write-Host "Example: 'Shared Documents/Rules*.*' or 'Documents/Subfolder/*Training*.docx'" -ForegroundColor Yellow
+            Write-Host "You provided: '$SourcePattern'" -ForegroundColor Gray
+            return $false
+        }
+        
         $folderPath = $SourcePattern.Substring(0, $SourcePattern.LastIndexOf('/'))
         $filePattern = $SourcePattern.Substring($SourcePattern.LastIndexOf('/') + 1)
         
@@ -438,25 +495,67 @@ function Invoke-MoveFiles {
                 return $false
             }
             
-            Write-Host "\nFound $($files.Count) file(s) to move\n" -ForegroundColor Green
+            if ($ListMode) {
+                if ([string]::IsNullOrWhiteSpace($DestinationFolder)) {
+                    Write-Host "\nFound $($files.Count) file(s):\n" -ForegroundColor Green
+                }
+                else {
+                    Write-Host "\nFound $($files.Count) file(s) that would be moved:\n" -ForegroundColor Green
+                }
+            }
+            else {
+                Write-Host "\nFound $($files.Count) file(s) to move\n" -ForegroundColor Green
+            }
             
             $successCount = 0
             $failCount = 0
             
             foreach ($file in $files) {
-                if (Move-SPOFileWithPDF -File $file -DestinationFolder $DestinationFolder) {
+                if ([string]::IsNullOrWhiteSpace($DestinationFolder)) {
+                    # Just list the file
+                    Write-Host "  $($file.Name)" -ForegroundColor White
+                    Write-Host "    Location: $($file.ServerRelativeUrl)" -ForegroundColor Gray
+                    
+                    # Check for associated PDF
+                    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
+                    $fileFolder = $file.ServerRelativeUrl.Substring(0, $file.ServerRelativeUrl.LastIndexOf('/'))
+                    $pdfPath = "$fileFolder/PDF/$baseName.pdf"
+                    try {
+                        $pdfFile = Get-PnPFile -Url $pdfPath -ErrorAction SilentlyContinue
+                        if ($null -ne $pdfFile) {
+                            Write-Host "    [✓] Has associated PDF: $pdfPath" -ForegroundColor Gray
+                        }
+                    }
+                    catch { }
+                    Write-Host ""
                     $successCount++
                 }
                 else {
-                    $failCount++
+                    if (Move-SPOFileWithPDF -File $file -DestinationFolder $DestinationFolder -ListMode:$ListMode) {
+                        $successCount++
+                    }
+                    else {
+                        $failCount++
+                    }
+                    Write-Host ""
                 }
-                Write-Host ""
             }
             
             Write-Host "=== Summary ===" -ForegroundColor Cyan
-            Write-Host "[✓] Successfully moved: $successCount file(s)" -ForegroundColor Green
-            if ($failCount -gt 0) {
-                Write-Host "[X] Failed to move: $failCount file(s)" -ForegroundColor Red
+            if ($ListMode -and [string]::IsNullOrWhiteSpace($DestinationFolder)) {
+                Write-Host "[✓] Found: $successCount file(s)" -ForegroundColor Green
+            }
+            elseif ($ListMode) {
+                Write-Host "[✓] Would move: $successCount file(s)" -ForegroundColor Green
+                if ($failCount -gt 0) {
+                    Write-Host "[X] Failed to process: $failCount file(s)" -ForegroundColor Red
+                }
+            }
+            else {
+                Write-Host "[✓] Successfully moved: $successCount file(s)" -ForegroundColor Green
+                if ($failCount -gt 0) {
+                    Write-Host "[X] Failed to move: $failCount file(s)" -ForegroundColor Red
+                }
             }
             
             return ($failCount -eq 0)
@@ -473,11 +572,39 @@ function Invoke-MoveFiles {
             $fileObj = Get-PnPFile -Url $SourcePattern -ErrorAction Stop
             
             Write-Host ""
-            $result = Move-SPOFileWithPDF -File $fileObj -DestinationFolder $DestinationFolder
-            Write-Host ""
             
-            if ($result) {
-                Write-Host "[✓] File move completed successfully" -ForegroundColor Green
+            if ([string]::IsNullOrWhiteSpace($DestinationFolder)) {
+                # Just list the file
+                Write-Host "  $($fileObj.Name)" -ForegroundColor White
+                Write-Host "    Location: $($fileObj.ServerRelativeUrl)" -ForegroundColor Gray
+                
+                # Check for associated PDF
+                $baseName = [System.IO.Path]::GetFileNameWithoutExtension($fileObj.Name)
+                $fileFolder = $fileObj.ServerRelativeUrl.Substring(0, $fileObj.ServerRelativeUrl.LastIndexOf('/'))
+                $pdfPath = "$fileFolder/PDF/$baseName.pdf"
+                try {
+                    $pdfFile = Get-PnPFile -Url $pdfPath -ErrorAction SilentlyContinue
+                    if ($null -ne $pdfFile) {
+                        Write-Host "    [✓] Has associated PDF: $pdfPath" -ForegroundColor Gray
+                    }
+                }
+                catch { }
+                Write-Host ""
+                Write-Host "[✓] File found" -ForegroundColor Green
+                $result = $true
+            }
+            else {
+                $result = Move-SPOFileWithPDF -File $fileObj -DestinationFolder $DestinationFolder -ListMode:$ListMode
+                Write-Host ""
+                
+                if ($result) {
+                    if ($ListMode) {
+                        Write-Host "[✓] File list completed successfully" -ForegroundColor Green
+                    }
+                    else {
+                        Write-Host "[✓] File move completed successfully" -ForegroundColor Green
+                    }
+                }
             }
             
             return $result
@@ -536,7 +663,7 @@ if ($Connect) {
     Write-Host "`n[✓] Connection successful! You can now use PnP cmdlets." -ForegroundColor Green
     
     # If no other actions specified, exit successfully
-    if (-not $Check -and -not $MoveFile) {
+    if (-not $Check -and -not $MoveFile -and -not $ListFiles) {
         exit 0
     }
 }
@@ -569,12 +696,30 @@ elseif ($MoveFile) {
         exit 1
     }
 }
+elseif ($ListFiles) {
+    # Destination is optional for ListFiles
+    if ([string]::IsNullOrWhiteSpace($Destination)) {
+        $result = Invoke-MoveFiles -SourcePattern $ListFiles -ListMode
+    }
+    else {
+        $result = Invoke-MoveFiles -SourcePattern $ListFiles -DestinationFolder $Destination -ListMode
+    }
+    
+    if ($result) {
+        exit 0
+    }
+    else {
+        exit 1
+    }
+}
 elseif (-not $Connect) {
     # Only show help if no parameters were provided at all
     Write-Host "No action specified. Available options:" -ForegroundColor Yellow
     Write-Host "  -Check                    Verify environment setup" -ForegroundColor Gray
     Write-Host "  -Connect <tenant|tenant/site|url>   Connect to a SharePoint site" -ForegroundColor Gray
     Write-Host "  -MoveFile <src> -Destination <dest>   Move file(s) to destination" -ForegroundColor Gray
+    Write-Host "  -ListFiles <pattern>      List files matching pattern" -ForegroundColor Gray
+    Write-Host "  -ListFiles <src> -Destination <dest>  Preview files that would be moved (dry run)" -ForegroundColor Gray
     Write-Host "\nExamples:" -ForegroundColor Cyan
     Write-Host "  .\Move-SPOFiles.ps1 -Check" -ForegroundColor White
     Write-Host "  .\Move-SPOFiles.ps1 -Connect 'contoso'" -ForegroundColor White
@@ -583,4 +728,6 @@ elseif (-not $Connect) {
     Write-Host "  .\Move-SPOFiles.ps1 -Connect 'contoso/mysite' -Check" -ForegroundColor White
     Write-Host "  .\Move-SPOFiles.ps1 -MoveFile 'Shared Documents/file.docx' -Destination 'Shared Documents/Archive'" -ForegroundColor White
     Write-Host "  .\Move-SPOFiles.ps1 -Connect 'contoso/mysite' -MoveFile 'Shared Documents/*Training*.docx' -Destination 'Shared Documents/Training'" -ForegroundColor White
+    Write-Host "  .\Move-SPOFiles.ps1 -ListFiles 'Shared Documents/*Training*.docx'" -ForegroundColor White
+    Write-Host "  .\Move-SPOFiles.ps1 -ListFiles 'Shared Documents/*Training*.docx' -Destination 'Shared Documents/Training'" -ForegroundColor White
 }
