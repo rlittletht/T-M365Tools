@@ -106,12 +106,15 @@ param(
     [switch]$All
 )
 
-# Check if Microsoft.Graph module is installed
-if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Authentication)) {
+# Check if Microsoft.Graph.Authentication module is installed
+$authModule = Get-Module -ListAvailable -Name Microsoft.Graph.Authentication | Sort-Object Version -Descending | Select-Object -First 1
+
+if (-not $authModule) {
     Write-Host "Microsoft.Graph.Authentication module not found. Installing..." -ForegroundColor Yellow
     try {
-        Install-Module Microsoft.Graph.Authentication -Scope CurrentUser -Force -AllowClobber
-        Write-Host "Module installed successfully." -ForegroundColor Green
+        Install-Module Microsoft.Graph.Authentication -Scope CurrentUser -Force -AllowClobber -SkipPublisherCheck
+        Write-Host "Module installed successfully. Please restart your PowerShell session." -ForegroundColor Green
+        exit 0
     }
     catch {
         Write-Error "Failed to install Microsoft.Graph.Authentication module: $_"
@@ -119,8 +122,24 @@ if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Authentication)) {
     }
 }
 
-# Import required modules
-Import-Module Microsoft.Graph.Authentication
+# Import required module  
+try {
+    Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+}
+catch {
+    # Check if this is a version mismatch error
+    if ($_.Exception.Message -like "*Could not load type*Microsoft.Graph*") {
+        Write-Error "Module version conflict detected. Run these commands to fix:"
+        Write-Host "`n  Get-Module Microsoft.Graph* | Remove-Module -Force" -ForegroundColor Cyan
+        Write-Host "  Uninstall-Module Microsoft.Graph.Authentication -AllVersions -Force" -ForegroundColor Cyan
+        Write-Host "  Install-Module Microsoft.Graph.Authentication -Scope CurrentUser -Force -AllowClobber" -ForegroundColor Cyan
+        Write-Host "`nThen restart PowerShell and try again.`n" -ForegroundColor Yellow
+    }
+    else {
+        Write-Error "Failed to import Microsoft.Graph.Authentication module: $_"
+    }
+    exit 1
+}
 
 # Validate parameters
 if (-not $ShareLink -and -not $InputList -and -not $InputCsv) {
@@ -290,17 +309,40 @@ try {
     }
     elseif ($UseInteractive) {
         # Interactive authentication
-        Connect-MgGraph -Scopes "Files.Read.All", "Sites.Read.All" -NoWelcome
+        try {
+            Connect-MgGraph -Scopes "Files.Read.All", "Sites.Read.All" -NoWelcome -ErrorAction Stop
+        }
+        catch {
+            Write-Error "Interactive authentication failed: $_"
+            Write-Host "`nTroubleshooting tips:" -ForegroundColor Yellow
+            Write-Host "1. Make sure you have a web browser available" -ForegroundColor Cyan
+            Write-Host "2. Try using -UseAzCli instead (run 'az login' first)" -ForegroundColor Cyan
+            Write-Host "3. Check if you have the required permissions in your tenant`n" -ForegroundColor Cyan
+            exit 1
+        }
     }
     elseif ($TenantId -and $ClientId -and $ClientSecret) {
         # App-only authentication
         $SecureClientSecret = ConvertTo-SecureString -String $ClientSecret -AsPlainText -Force
         $ClientSecretCredential = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $ClientId, $SecureClientSecret
         
-        Connect-MgGraph -TenantId $TenantId -ClientSecretCredential $ClientSecretCredential -NoWelcome
+        try {
+            Connect-MgGraph -TenantId $TenantId -ClientSecretCredential $ClientSecretCredential -NoWelcome -ErrorAction Stop
+        }
+        catch {
+            Write-Error "App-only authentication failed: $_"
+            exit 1
+        }
     }
     else {
         Write-Error "Please specify an authentication method: -UseAzCli, -UseInteractive, or provide TenantId, ClientId, and ClientSecret."
+        exit 1
+    }
+    
+    # Verify authentication succeeded
+    $context = Get-MgContext
+    if (-not $context) {
+        Write-Error "Authentication verification failed. Not connected to Microsoft Graph."
         exit 1
     }
     
