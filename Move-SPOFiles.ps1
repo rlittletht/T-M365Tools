@@ -29,8 +29,8 @@
 .PARAMETER Connect
     Connects to a SharePoint site. Accepts multiple formats:
     - Tenant name only: 'contoso' → connects to https://contoso.sharepoint.com
-    - Tenant/site: 'contoso/mysite' → connects to https://contoso.sharepoint.com/sites/mysite
-    - Full URL: 'https://contoso.sharepoint.com/sites/mysite'
+    - Tenant/site: 'contoso/mysite' → connects to https://contoso.sharepoint.com/mysite
+    - Full URL: 'https://contoso.sharepoint.com/mysite'
     This parameter is processed first, allowing you to combine it with other actions like -Check or -MoveFile.
 
 .PARAMETER MoveFile
@@ -47,6 +47,10 @@
     If -Destination is specified, shows where files would be moved to.
     If -Destination is omitted, simply lists the matching files.
 
+.PARAMETER Verbose
+    Shows detailed output including each PnP.PowerShell command before it's executed.
+    This is useful for troubleshooting and understanding what operations the script is performing.
+
 .EXAMPLE
     .\Move-SPOFiles.ps1 -Check
     Checks if PnP.PowerShell is installed and if connected to a SharePoint site.
@@ -57,10 +61,10 @@
 
 .EXAMPLE
     .\Move-SPOFiles.ps1 -Connect "contoso/mysite"
-    Connects to https://contoso.sharepoint.com/sites/mysite using interactive authentication.
+    Connects to https://contoso.sharepoint.com/mysite using interactive authentication.
 
 .EXAMPLE
-    .\Move-SPOFiles.ps1 -Connect "https://contoso.sharepoint.com/sites/ProjectSite"
+    .\Move-SPOFiles.ps1 -Connect "https://contoso.sharepoint.com/ProjectSite"
     Connects to the specified SharePoint site URL using interactive authentication.
 
 .EXAMPLE
@@ -82,6 +86,10 @@
 .EXAMPLE
     .\Move-SPOFiles.ps1 -ListFiles "Shared Documents/*Training*.docx" -Destination "Shared Documents/Training"
     Lists files that would be moved without actually moving them (dry run).
+
+.EXAMPLE
+    .\Move-SPOFiles.ps1 -MoveFile "Shared Documents/file.docx" -Destination "Shared Documents/Archive" -Verbose
+    Moves a file with verbose output showing each PnP.PowerShell command being executed.
 
 .NOTES
     Author: Created for M365 Tools
@@ -158,14 +166,15 @@ function Test-PnPConnection {
     Write-Host "`n=== Checking PnP Connection ===" -ForegroundColor Cyan
     
     try {
+        Write-Verbose "Executing: Get-PnPConnection"
         $connection = Get-PnPConnection -ErrorAction Stop
         
         if ($null -eq $connection) {
             Write-Host "[X] Not connected to a SharePoint site." -ForegroundColor Red
             Write-Host "`nTo connect to a SharePoint site, run:" -ForegroundColor Yellow
-            Write-Host "    Connect-PnPOnline -Url 'https://yourtenant.sharepoint.com/sites/yoursite' -Interactive" -ForegroundColor White
+            Write-Host "    Connect-PnPOnline -Url 'https://yourtenant.sharepoint.com/yoursite' -Interactive" -ForegroundColor White
             Write-Host "`nOr use other authentication methods:" -ForegroundColor Yellow
-            Write-Host "    Connect-PnPOnline -Url 'https://yourtenant.sharepoint.com/sites/yoursite' -UseWebLogin" -ForegroundColor White
+            Write-Host "    Connect-PnPOnline -Url 'https://yourtenant.sharepoint.com/yoursite' -UseWebLogin" -ForegroundColor White
             return $false
         }
         
@@ -177,9 +186,9 @@ function Test-PnPConnection {
     catch {
         Write-Host "[X] Not connected to a SharePoint site." -ForegroundColor Red
         Write-Host "`nTo connect to a SharePoint site, run:" -ForegroundColor Yellow
-        Write-Host "    Connect-PnPOnline -Url 'https://yourtenant.sharepoint.com/sites/yoursite' -Interactive" -ForegroundColor White
+        Write-Host "    Connect-PnPOnline -Url 'https://yourtenant.sharepoint.com/yoursite' -Interactive" -ForegroundColor White
         Write-Host "`nOr use other authentication methods:" -ForegroundColor Yellow
-        Write-Host "    Connect-PnPOnline -Url 'https://yourtenant.sharepoint.com/sites/yoursite' -UseWebLogin" -ForegroundColor White
+        Write-Host "    Connect-PnPOnline -Url 'https://yourtenant.sharepoint.com/yoursite' -UseWebLogin" -ForegroundColor White
         return $false
     }
 }
@@ -260,10 +269,12 @@ function Connect-ToPnP {
     
     try {
         Write-Host "`nAttempting to connect using Interactive authentication..." -ForegroundColor Yellow
+        Write-Verbose "Executing: Connect-PnPOnline -Url $SiteUrl -Interactive"
         Connect-PnPOnline -Url $SiteUrl -Interactive -ErrorAction Stop
         Write-Host "[✓] Successfully connected to SharePoint site!" -ForegroundColor Green
         
         # Verify connection
+        Write-Verbose "Executing: Get-PnPConnection"
         $connection = Get-PnPConnection
         Write-Host "    Connected to: $($connection.Url)" -ForegroundColor Gray
         Write-Host "    Connection Type: $($connection.ConnectionType)" -ForegroundColor Gray
@@ -319,6 +330,46 @@ function Invoke-EnvironmentCheck {
     }
 }
 
+function Get-NormalizedPath {
+    <#
+    .SYNOPSIS
+        Normalizes a path to ensure it has the site's server-relative prefix.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Path
+    )
+    
+    # Get the connection to determine the site's server-relative URL
+    try {
+        $connection = Get-PnPConnection -ErrorAction Stop
+        $siteUrl = $connection.Url
+        
+        # Extract the server-relative part from the site URL
+        # e.g., https://tenant.sharepoint.com/sitename -> /sitename
+        $uri = [System.Uri]$siteUrl
+        $serverRelativeSiteUrl = $uri.AbsolutePath
+        
+        # Remove trailing slash from site URL if present
+        $serverRelativeSiteUrl = $serverRelativeSiteUrl.TrimEnd('/')
+        
+        # If path already has the site prefix, return as-is
+        if ($Path.StartsWith($serverRelativeSiteUrl + '/') -or $Path -eq $serverRelativeSiteUrl) {
+            return $Path
+        }
+        
+        # Remove leading slash from path if present to avoid double slashes
+        $Path = $Path.TrimStart('/')
+        
+        # Combine with the site's server-relative URL
+        return "$serverRelativeSiteUrl/$Path"
+    }
+    catch {
+        # If we can't get connection, return path as-is
+        return $Path
+    }
+}
+
 function Move-SPOFileWithPDF {
     <#
     .SYNOPSIS
@@ -340,6 +391,9 @@ function Move-SPOFileWithPDF {
         $fileServerRelativeUrl = $File.ServerRelativeUrl
         $fileFolder = $File.ServerRelativeUrl.Substring(0, $File.ServerRelativeUrl.LastIndexOf('/'))
         
+        # Normalize the destination folder to include site prefix
+        $normalizedDestination = Get-NormalizedPath -Path $DestinationFolder
+        
         # Get the base name without extension
         $baseName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
         $extension = [System.IO.Path]::GetExtension($fileName)
@@ -351,6 +405,7 @@ function Move-SPOFileWithPDF {
         $hasPDF = $false
         
         try {
+            Write-Verbose "Executing: Get-PnPFile -Url $pdfPath"
             $pdfFile = Get-PnPFile -Url $pdfPath -ErrorAction SilentlyContinue
             if ($null -ne $pdfFile) {
                 $hasPDF = $true
@@ -364,41 +419,46 @@ function Move-SPOFileWithPDF {
         # If in list mode, just show what would be moved
         if ($ListMode) {
             if ($hasPDF) {
-                $pdfDestFolder = "$DestinationFolder/PDF"
+                $pdfDestFolder = "$normalizedDestination/PDF"
                 Write-Host "    [→] Would move PDF to: $pdfDestFolder/$baseName.pdf" -ForegroundColor Blue
             }
-            $targetUrl = "$DestinationFolder/$fileName"
+            $targetUrl = "$normalizedDestination/$fileName"
             Write-Host "    [→] Would move file to: $targetUrl" -ForegroundColor Blue
             return $true
         }
         
         # Move the PDF first if it exists
         if ($hasPDF) {
-            $pdfDestFolder = "$DestinationFolder/PDF"
+            $pdfDestFolder = "$normalizedDestination/PDF"
             
             # Ensure PDF destination folder exists
             try {
+                Write-Verbose "Executing: Get-PnPFolder -Url $pdfDestFolder"
                 $pdfFolder = Get-PnPFolder -Url $pdfDestFolder -ErrorAction SilentlyContinue
                 if ($null -eq $pdfFolder) {
                     Write-Host "    [!] Creating PDF subfolder: $pdfDestFolder" -ForegroundColor Yellow
-                    $null = Add-PnPFolder -Name "PDF" -Folder $DestinationFolder -ErrorAction Stop
+                    Write-Verbose "Executing: Add-PnPFolder -Name 'PDF' -Folder $normalizedDestination"
+                    $null = Add-PnPFolder -Name "PDF" -Folder $normalizedDestination -ErrorAction Stop
                 }
             }
             catch {
                 Write-Host "    [!] Creating destination folder structure" -ForegroundColor Yellow
                 # May need to create parent folders
+                Write-Verbose "Executing: Resolve-PnPFolder -SiteRelativePath $pdfDestFolder"
                 $null = Resolve-PnPFolder -SiteRelativePath $pdfDestFolder
             }
             
             # Move the PDF
             Write-Host "    [→] Moving PDF to: $pdfDestFolder/$baseName.pdf" -ForegroundColor Gray
+            Write-Verbose "Executing: Move-PnPFile -SourceUrl $pdfPath -TargetUrl '$pdfDestFolder/$baseName.pdf' -Force"
             Move-PnPFile -SourceUrl $pdfPath -TargetUrl "$pdfDestFolder/$baseName.pdf" -Force -ErrorAction Stop
             Write-Host "    [✓] PDF moved successfully" -ForegroundColor Green
         }
         
         # Move the main file
-        $targetUrl = "$DestinationFolder/$fileName"
+        $targetUrl = "$normalizedDestination/$fileName"
         Write-Host "    [→] Moving file to: $targetUrl" -ForegroundColor Gray
+        Write-Verbose "Executing: Move-PnPFile -SourceUrl $fileServerRelativeUrl -TargetUrl $targetUrl -Force"
         Move-PnPFile -SourceUrl $fileServerRelativeUrl -TargetUrl $targetUrl -Force -ErrorAction Stop
         Write-Host "    [✓] File moved successfully" -ForegroundColor Green
         
@@ -444,6 +504,7 @@ function Invoke-MoveFiles {
     
     # Ensure we're connected
     try {
+        Write-Verbose "Executing: Get-PnPConnection"
         $connection = Get-PnPConnection -ErrorAction Stop
         if ($null -eq $connection) {
             Write-Host "\n[X] Not connected to SharePoint. Use -Connect first." -ForegroundColor Red
@@ -455,12 +516,20 @@ function Invoke-MoveFiles {
         return $false
     }
     
+    # Normalize the destination folder if provided
+    if (-not [string]::IsNullOrWhiteSpace($DestinationFolder)) {
+        $DestinationFolder = Get-NormalizedPath -Path $DestinationFolder
+        Write-Verbose "Normalized destination path: $DestinationFolder"
+    }
+    
     # Ensure destination folder exists (skip in list mode or if no destination specified)
     if (-not $ListMode -and -not [string]::IsNullOrWhiteSpace($DestinationFolder)) {
         try {
+            Write-Verbose "Executing: Get-PnPFolder -Url $DestinationFolder"
             $destFolder = Get-PnPFolder -Url $DestinationFolder -ErrorAction SilentlyContinue
             if ($null -eq $destFolder) {
                 Write-Host "\n[!] Destination folder doesn't exist. Creating: $DestinationFolder" -ForegroundColor Yellow
+                Write-Verbose "Executing: Resolve-PnPFolder -SiteRelativePath $DestinationFolder"
                 $null = Resolve-PnPFolder -SiteRelativePath $DestinationFolder
             }
         }
@@ -484,9 +553,14 @@ function Invoke-MoveFiles {
         $folderPath = $SourcePattern.Substring(0, $SourcePattern.LastIndexOf('/'))
         $filePattern = $SourcePattern.Substring($SourcePattern.LastIndexOf('/') + 1)
         
+        # Normalize the folder path
+        $folderPath = Get-NormalizedPath -Path $folderPath
+        Write-Verbose "Normalized source folder path: $folderPath"
+        
         Write-Host "\nSearching for files matching pattern in: $folderPath" -ForegroundColor Yellow
         
         try {
+            Write-Verbose "Executing: Get-PnPFolderItem -FolderSiteRelativeUrl $folderPath -ItemType File | Where-Object { Name -like '$filePattern' }"
             $files = Get-PnPFolderItem -FolderSiteRelativeUrl $folderPath -ItemType File -ErrorAction Stop | 
                      Where-Object { $_.Name -like $filePattern }
             
@@ -521,6 +595,7 @@ function Invoke-MoveFiles {
                     $fileFolder = $file.ServerRelativeUrl.Substring(0, $file.ServerRelativeUrl.LastIndexOf('/'))
                     $pdfPath = "$fileFolder/PDF/$baseName.pdf"
                     try {
+                        Write-Verbose "Executing: Get-PnPFile -Url $pdfPath"
                         $pdfFile = Get-PnPFile -Url $pdfPath -ErrorAction SilentlyContinue
                         if ($null -ne $pdfFile) {
                             Write-Host "    [✓] Has associated PDF: $pdfPath" -ForegroundColor Gray
@@ -567,9 +642,15 @@ function Invoke-MoveFiles {
     }
     else {
         # Single file
+        # Normalize the source pattern if it's not already a server-relative URL
+        $normalizedSource = Get-NormalizedPath -Path $SourcePattern
+        Write-Verbose "Normalized source file path: $normalizedSource"
+        
         try {
-            $file = Get-PnPFile -Url $SourcePattern -AsListItem -ErrorAction Stop
-            $fileObj = Get-PnPFile -Url $SourcePattern -ErrorAction Stop
+            Write-Verbose "Executing: Get-PnPFile -Url $normalizedSource -AsListItem"
+            $file = Get-PnPFile -Url $normalizedSource -AsListItem -ErrorAction Stop
+            Write-Verbose "Executing: Get-PnPFile -Url $normalizedSource"
+            $fileObj = Get-PnPFile -Url $normalizedSource -ErrorAction Stop
             
             Write-Host ""
             
@@ -583,6 +664,7 @@ function Invoke-MoveFiles {
                 $fileFolder = $fileObj.ServerRelativeUrl.Substring(0, $fileObj.ServerRelativeUrl.LastIndexOf('/'))
                 $pdfPath = "$fileFolder/PDF/$baseName.pdf"
                 try {
+                    Write-Verbose "Executing: Get-PnPFile -Url $pdfPath"
                     $pdfFile = Get-PnPFile -Url $pdfPath -ErrorAction SilentlyContinue
                     if ($null -ne $pdfFile) {
                         Write-Host "    [✓] Has associated PDF: $pdfPath" -ForegroundColor Gray
@@ -632,7 +714,7 @@ if ($Connect) {
             # Format: tenant/site
             $tenantName = $matches[1]
             $siteName = $matches[2]
-            $siteUrl = "https://$tenantName.sharepoint.com/sites/$siteName"
+            $siteUrl = "https://$tenantName.sharepoint.com/$siteName"
             Write-Host "Using tenant: $tenantName" -ForegroundColor Gray
             Write-Host "Using site: $siteName" -ForegroundColor Gray
             Write-Host "Connecting to: $siteUrl" -ForegroundColor Gray
@@ -650,7 +732,7 @@ if ($Connect) {
         Write-Host "Expected formats:" -ForegroundColor Yellow
         Write-Host "  - Tenant name: 'contoso'" -ForegroundColor Gray
         Write-Host "  - Tenant/site: 'contoso/mysite'" -ForegroundColor Gray
-        Write-Host "  - Full URL: 'https://contoso.sharepoint.com/sites/mysite'" -ForegroundColor Gray
+        Write-Host "  - Full URL: 'https://contoso.sharepoint.com/mysite'" -ForegroundColor Gray
         exit 1
     }
     
@@ -720,14 +802,16 @@ elseif (-not $Connect) {
     Write-Host "  -MoveFile <src> -Destination <dest>   Move file(s) to destination" -ForegroundColor Gray
     Write-Host "  -ListFiles <pattern>      List files matching pattern" -ForegroundColor Gray
     Write-Host "  -ListFiles <src> -Destination <dest>  Preview files that would be moved (dry run)" -ForegroundColor Gray
+    Write-Host "  -Verbose                  Show detailed output including PnP commands" -ForegroundColor Gray
     Write-Host "\nExamples:" -ForegroundColor Cyan
     Write-Host "  .\Move-SPOFiles.ps1 -Check" -ForegroundColor White
     Write-Host "  .\Move-SPOFiles.ps1 -Connect 'contoso'" -ForegroundColor White
     Write-Host "  .\Move-SPOFiles.ps1 -Connect 'contoso/mysite'" -ForegroundColor White
-    Write-Host "  .\Move-SPOFiles.ps1 -Connect 'https://contoso.sharepoint.com/sites/mysite'" -ForegroundColor White
+    Write-Host "  .\Move-SPOFiles.ps1 -Connect 'https://contoso.sharepoint.com/mysite'" -ForegroundColor White
     Write-Host "  .\Move-SPOFiles.ps1 -Connect 'contoso/mysite' -Check" -ForegroundColor White
     Write-Host "  .\Move-SPOFiles.ps1 -MoveFile 'Shared Documents/file.docx' -Destination 'Shared Documents/Archive'" -ForegroundColor White
     Write-Host "  .\Move-SPOFiles.ps1 -Connect 'contoso/mysite' -MoveFile 'Shared Documents/*Training*.docx' -Destination 'Shared Documents/Training'" -ForegroundColor White
     Write-Host "  .\Move-SPOFiles.ps1 -ListFiles 'Shared Documents/*Training*.docx'" -ForegroundColor White
     Write-Host "  .\Move-SPOFiles.ps1 -ListFiles 'Shared Documents/*Training*.docx' -Destination 'Shared Documents/Training'" -ForegroundColor White
+    Write-Host "  .\Move-SPOFiles.ps1 -MoveFile 'Shared Documents/file.docx' -Destination 'Archive' -Verbose" -ForegroundColor White
 }
