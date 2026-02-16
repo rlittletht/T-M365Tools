@@ -27,7 +27,11 @@
     Verifies that PnP.PowerShell is installed and that you're connected to a SharePoint site.
 
 .PARAMETER Connect
-    Connects to a SharePoint site using the specified URL.
+    Connects to a SharePoint site. Accepts multiple formats:
+    - Tenant name only: 'contoso' → connects to https://contoso.sharepoint.com
+    - Tenant/site: 'contoso/mysite' → connects to https://contoso.sharepoint.com/sites/mysite
+    - Full URL: 'https://contoso.sharepoint.com/sites/mysite'
+    This parameter is processed first, allowing you to combine it with other actions like -Check or -MoveFile.
 
 .PARAMETER MoveFile
     The source file or pattern to move. Can be a single file path or a wildcard pattern.
@@ -41,8 +45,20 @@
     Checks if PnP.PowerShell is installed and if connected to a SharePoint site.
 
 .EXAMPLE
+    .\Move-SPOFiles.ps1 -Connect "contoso"
+    Connects to https://contoso.sharepoint.com using interactive authentication.
+
+.EXAMPLE
+    .\Move-SPOFiles.ps1 -Connect "contoso/mysite"
+    Connects to https://contoso.sharepoint.com/sites/mysite using interactive authentication.
+
+.EXAMPLE
     .\Move-SPOFiles.ps1 -Connect "https://contoso.sharepoint.com/sites/ProjectSite"
-    Connects to the specified SharePoint site using interactive authentication.
+    Connects to the specified SharePoint site URL using interactive authentication.
+
+.EXAMPLE
+    .\Move-SPOFiles.ps1 -Connect "contoso/mysite" -Check
+    Connects to SharePoint first, then verifies the environment setup.
 
 .EXAMPLE
     .\Move-SPOFiles.ps1 -MoveFile "Shared Documents/MyFile.docx" -Destination "Shared Documents/Archive"
@@ -474,28 +490,62 @@ function Invoke-MoveFiles {
 }
 
 # Main script logic
+
+# Handle -Connect first if provided
+if ($Connect) {
+    # Check if it's a full URL or just a tenant name
+    $siteUrl = $Connect
+    
+    if ($Connect -notmatch '^https://') {
+        # Not a full URL, parse the input
+        # Remove .sharepoint.com if user included it
+        $cleanInput = $Connect -replace '\.sharepoint\.com.*$', ''
+        
+        if ($cleanInput -match '^([^/]+)/(.+)$') {
+            # Format: tenant/site
+            $tenantName = $matches[1]
+            $siteName = $matches[2]
+            $siteUrl = "https://$tenantName.sharepoint.com/sites/$siteName"
+            Write-Host "Using tenant: $tenantName" -ForegroundColor Gray
+            Write-Host "Using site: $siteName" -ForegroundColor Gray
+            Write-Host "Connecting to: $siteUrl" -ForegroundColor Gray
+        }
+        else {
+            # Just a tenant name
+            $tenantName = $cleanInput
+            $siteUrl = "https://$tenantName.sharepoint.com"
+            Write-Host "Using tenant: $tenantName" -ForegroundColor Gray
+            Write-Host "Connecting to: $siteUrl" -ForegroundColor Gray
+        }
+    }
+    elseif ($Connect -notmatch '^https://.*\.sharepoint\.com') {
+        Write-Host "[X] Invalid SharePoint URL format." -ForegroundColor Red
+        Write-Host "Expected formats:" -ForegroundColor Yellow
+        Write-Host "  - Tenant name: 'contoso'" -ForegroundColor Gray
+        Write-Host "  - Tenant/site: 'contoso/mysite'" -ForegroundColor Gray
+        Write-Host "  - Full URL: 'https://contoso.sharepoint.com/sites/mysite'" -ForegroundColor Gray
+        exit 1
+    }
+    
+    $result = Connect-ToPnP -SiteUrl $siteUrl
+    
+    if (-not $result) {
+        exit 1
+    }
+    
+    Write-Host "`n[✓] Connection successful! You can now use PnP cmdlets." -ForegroundColor Green
+    
+    # If no other actions specified, exit successfully
+    if (-not $Check -and -not $MoveFile) {
+        exit 0
+    }
+}
+
+# Handle other actions
 if ($Check) {
     $result = Invoke-EnvironmentCheck
     
     if ($result) {
-        exit 0
-    }
-    else {
-        exit 1
-    }
-}
-elseif ($Connect) {
-    # Validate URL format
-    if ($Connect -notmatch '^https://.*\.sharepoint\.com/') {
-        Write-Host "[X] Invalid SharePoint URL format." -ForegroundColor Red
-        Write-Host "Expected format: https://yourtenant.sharepoint.com/sites/yoursite" -ForegroundColor Yellow
-        exit 1
-    }
-    
-    $result = Connect-ToPnP -SiteUrl $Connect
-    
-    if ($result) {
-        Write-Host "`n[✓] Connection successful! You can now use PnP cmdlets." -ForegroundColor Green
         exit 0
     }
     else {
@@ -519,14 +569,18 @@ elseif ($MoveFile) {
         exit 1
     }
 }
-else {
+elseif (-not $Connect) {
+    # Only show help if no parameters were provided at all
     Write-Host "No action specified. Available options:" -ForegroundColor Yellow
     Write-Host "  -Check                    Verify environment setup" -ForegroundColor Gray
-    Write-Host "  -Connect <url>            Connect to a SharePoint site" -ForegroundColor Gray
+    Write-Host "  -Connect <tenant|tenant/site|url>   Connect to a SharePoint site" -ForegroundColor Gray
     Write-Host "  -MoveFile <src> -Destination <dest>   Move file(s) to destination" -ForegroundColor Gray
     Write-Host "\nExamples:" -ForegroundColor Cyan
     Write-Host "  .\Move-SPOFiles.ps1 -Check" -ForegroundColor White
-    Write-Host "  .\Move-SPOFiles.ps1 -Connect 'https://contoso.sharepoint.com/sites/ProjectSite'" -ForegroundColor White
+    Write-Host "  .\Move-SPOFiles.ps1 -Connect 'contoso'" -ForegroundColor White
+    Write-Host "  .\Move-SPOFiles.ps1 -Connect 'contoso/mysite'" -ForegroundColor White
+    Write-Host "  .\Move-SPOFiles.ps1 -Connect 'https://contoso.sharepoint.com/sites/mysite'" -ForegroundColor White
+    Write-Host "  .\Move-SPOFiles.ps1 -Connect 'contoso/mysite' -Check" -ForegroundColor White
     Write-Host "  .\Move-SPOFiles.ps1 -MoveFile 'Shared Documents/file.docx' -Destination 'Shared Documents/Archive'" -ForegroundColor White
-    Write-Host "  .\Move-SPOFiles.ps1 -MoveFile 'Shared Documents/*Training*.docx' -Destination 'Shared Documents/Training'" -ForegroundColor White
+    Write-Host "  .\Move-SPOFiles.ps1 -Connect 'contoso/mysite' -MoveFile 'Shared Documents/*Training*.docx' -Destination 'Shared Documents/Training'" -ForegroundColor White
 }
