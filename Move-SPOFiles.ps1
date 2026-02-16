@@ -330,44 +330,90 @@ function Invoke-EnvironmentCheck {
     }
 }
 
-function Get-NormalizedPath {
+function Get-ServerRelativePath {
     <#
     .SYNOPSIS
-        Normalizes a path to ensure it has the site's server-relative prefix.
+        Returns a path relative to the server/tenant (includes the site's base path).
+        This format is used by Move-PnPFile, Get-PnPFile, etc.
     #>
     param(
         [Parameter(Mandatory=$true)]
         [string]$Path
     )
     
-    # Get the connection to determine the site's server-relative URL
     try {
         $connection = Get-PnPConnection -ErrorAction Stop
         $siteUrl = $connection.Url
         
         # Extract the server-relative part from the site URL
-        # e.g., https://tenant.sharepoint.com/sitename -> /sitename
+        # e.g., https://tenant.sharepoint.com/mysite -> /mysite
         $uri = [System.Uri]$siteUrl
-        $serverRelativeSiteUrl = $uri.AbsolutePath
+        $serverRelativeSiteUrl = $uri.AbsolutePath.TrimEnd('/')
         
-        # Remove trailing slash from site URL if present
-        $serverRelativeSiteUrl = $serverRelativeSiteUrl.TrimEnd('/')
-        
-        # If path already has the site prefix, return as-is
+        # If path already has the full site prefix, return as-is
         if ($Path.StartsWith($serverRelativeSiteUrl + '/') -or $Path -eq $serverRelativeSiteUrl) {
             return $Path
         }
         
-        # Remove leading slash from path if present to avoid double slashes
-        $Path = $Path.TrimStart('/')
+        # Remove leading slash to avoid double slashes
+        $cleanPath = $Path.TrimStart('/')
         
         # Combine with the site's server-relative URL
-        return "$serverRelativeSiteUrl/$Path"
+        return "$serverRelativeSiteUrl/$cleanPath"
     }
     catch {
-        # If we can't get connection, return path as-is
         return $Path
     }
+}
+
+function Get-SiteRelativePath {
+    <#
+    .SYNOPSIS
+        Returns a path relative to the site (excludes site prefix).
+        This format is used by Get-PnPFolderItem, Resolve-PnPFolder, etc.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Path
+    )
+    
+    try {
+        $connection = Get-PnPConnection -ErrorAction Stop
+        $siteUrl = $connection.Url
+        
+        # Extract the server-relative part from the site URL
+        $uri = [System.Uri]$siteUrl
+        $serverRelativeSiteUrl = $uri.AbsolutePath.TrimEnd('/')
+        
+        # Remove leading slash for consistency
+        $cleanPath = $Path.TrimStart('/')
+        
+        # If path starts with the site prefix, remove it
+        if ($cleanPath.StartsWith($serverRelativeSiteUrl.TrimStart('/') + '/')) {
+            $sitePrefix = $serverRelativeSiteUrl.TrimStart('/') + '/'
+            return $cleanPath.Substring($sitePrefix.Length)
+        }
+        
+        # If path already doesn't have the site prefix, return it
+        return $cleanPath
+    }
+    catch {
+        return $Path.TrimStart('/')
+    }
+}
+
+function Get-NormalizedPath {
+    <#
+    .SYNOPSIS
+        Deprecated: Use Get-ServerRelativePath or Get-SiteRelativePath instead.
+        Defaults to Get-ServerRelativePath for backward compatibility.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Path
+    )
+    
+    return Get-ServerRelativePath -Path $Path
 }
 
 function Move-SPOFileWithPDF {
@@ -391,8 +437,8 @@ function Move-SPOFileWithPDF {
         $fileServerRelativeUrl = $File.ServerRelativeUrl
         $fileFolder = $File.ServerRelativeUrl.Substring(0, $File.ServerRelativeUrl.LastIndexOf('/'))
         
-        # Normalize the destination folder to include site prefix
-        $normalizedDestination = Get-NormalizedPath -Path $DestinationFolder
+        # Normalize the destination folder with server-relative path (for Move-PnPFile)
+        $normalizedDestination = Get-ServerRelativePath -Path $DestinationFolder
         
         # Get the base name without extension
         $baseName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
@@ -443,9 +489,10 @@ function Move-SPOFileWithPDF {
             }
             catch {
                 Write-Host "    [!] Creating destination folder structure" -ForegroundColor Yellow
-                # May need to create parent folders
-                Write-Verbose "Executing: Resolve-PnPFolder -SiteRelativePath $pdfDestFolder"
-                $null = Resolve-PnPFolder -SiteRelativePath $pdfDestFolder
+                # May need to create parent folders - Resolve-PnPFolder needs site-relative path
+                $pdfDestFolderSiteRelative = Get-SiteRelativePath -Path $pdfDestFolder
+                Write-Verbose "Executing: Resolve-PnPFolder -SiteRelativePath $pdfDestFolderSiteRelative"
+                $null = Resolve-PnPFolder -SiteRelativePath $pdfDestFolderSiteRelative
             }
             
             # Move the PDF
@@ -488,14 +535,14 @@ function Invoke-MoveFiles {
     
     if ($ListMode) {
         if ([string]::IsNullOrWhiteSpace($DestinationFolder)) {
-            Write-Host "\n=== Listing Files ===" -ForegroundColor Cyan
+            Write-Host "`n=== Listing Files ===" -ForegroundColor Cyan
         }
         else {
-            Write-Host "\n=== Listing Files (Dry Run) ===" -ForegroundColor Cyan
+            Write-Host "`n=== Listing Files (Dry Run) ===" -ForegroundColor Cyan
         }
     }
     else {
-        Write-Host "\n=== Moving Files ===" -ForegroundColor Cyan
+        Write-Host "`n=== Moving Files ===" -ForegroundColor Cyan
     }
     Write-Host "Source: $SourcePattern" -ForegroundColor Gray
     if (-not [string]::IsNullOrWhiteSpace($DestinationFolder)) {
@@ -507,18 +554,18 @@ function Invoke-MoveFiles {
         Write-Verbose "Executing: Get-PnPConnection"
         $connection = Get-PnPConnection -ErrorAction Stop
         if ($null -eq $connection) {
-            Write-Host "\n[X] Not connected to SharePoint. Use -Connect first." -ForegroundColor Red
+            Write-Host "`n[X] Not connected to SharePoint. Use -Connect first." -ForegroundColor Red
             return $false
         }
     }
     catch {
-        Write-Host "\n[X] Not connected to SharePoint. Use -Connect first." -ForegroundColor Red
+        Write-Host "`n[X] Not connected to SharePoint. Use -Connect first." -ForegroundColor Red
         return $false
     }
     
-    # Normalize the destination folder if provided
+    # Normalize the destination folder if provided (server-relative for Move-PnPFile operations)
     if (-not [string]::IsNullOrWhiteSpace($DestinationFolder)) {
-        $DestinationFolder = Get-NormalizedPath -Path $DestinationFolder
+        $DestinationFolder = Get-ServerRelativePath -Path $DestinationFolder
         Write-Verbose "Normalized destination path: $DestinationFolder"
     }
     
@@ -528,13 +575,15 @@ function Invoke-MoveFiles {
             Write-Verbose "Executing: Get-PnPFolder -Url $DestinationFolder"
             $destFolder = Get-PnPFolder -Url $DestinationFolder -ErrorAction SilentlyContinue
             if ($null -eq $destFolder) {
-                Write-Host "\n[!] Destination folder doesn't exist. Creating: $DestinationFolder" -ForegroundColor Yellow
-                Write-Verbose "Executing: Resolve-PnPFolder -SiteRelativePath $DestinationFolder"
-                $null = Resolve-PnPFolder -SiteRelativePath $DestinationFolder
+                Write-Host "`n[!] Destination folder doesn't exist. Creating: $DestinationFolder" -ForegroundColor Yellow
+                # Resolve-PnPFolder needs site-relative path
+                $destFolderSiteRelative = Get-SiteRelativePath -Path $DestinationFolder
+                Write-Verbose "Executing: Resolve-PnPFolder -SiteRelativePath $destFolderSiteRelative"
+                $null = Resolve-PnPFolder -SiteRelativePath $destFolderSiteRelative
             }
         }
         catch {
-            Write-Host "\n[X] Failed to create destination folder: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "`n[X] Failed to create destination folder: $($_.Exception.Message)" -ForegroundColor Red
             return $false
         }
     }
@@ -544,7 +593,7 @@ function Invoke-MoveFiles {
         # Pattern - get matching files
         # Validate that pattern includes a folder path
         if ($SourcePattern -notmatch '/') {
-            Write-Host "\n[X] Pattern must include a folder path." -ForegroundColor Red
+            Write-Host "`n[X] Pattern must include a folder path." -ForegroundColor Red
             Write-Host "Example: 'Shared Documents/Rules*.*' or 'Documents/Subfolder/*Training*.docx'" -ForegroundColor Yellow
             Write-Host "You provided: '$SourcePattern'" -ForegroundColor Gray
             return $false
@@ -553,11 +602,11 @@ function Invoke-MoveFiles {
         $folderPath = $SourcePattern.Substring(0, $SourcePattern.LastIndexOf('/'))
         $filePattern = $SourcePattern.Substring($SourcePattern.LastIndexOf('/') + 1)
         
-        # Normalize the folder path
-        $folderPath = Get-NormalizedPath -Path $folderPath
-        Write-Verbose "Normalized source folder path: $folderPath"
+        # Get-PnPFolderItem needs site-relative path
+        $folderPath = Get-SiteRelativePath -Path $folderPath
+        Write-Verbose "Normalized source folder path (site-relative): $folderPath"
         
-        Write-Host "\nSearching for files matching pattern in: $folderPath" -ForegroundColor Yellow
+        Write-Host "`nSearching for files matching pattern in: $folderPath" -ForegroundColor Yellow
         
         try {
             Write-Verbose "Executing: Get-PnPFolderItem -FolderSiteRelativeUrl $folderPath -ItemType File | Where-Object { Name -like '$filePattern' }"
@@ -565,20 +614,20 @@ function Invoke-MoveFiles {
                      Where-Object { $_.Name -like $filePattern }
             
             if ($files.Count -eq 0) {
-                Write-Host "\n[!] No files found matching pattern: $filePattern" -ForegroundColor Yellow
+                Write-Host "`n[!] No files found matching pattern: $filePattern" -ForegroundColor Yellow
                 return $false
             }
             
             if ($ListMode) {
                 if ([string]::IsNullOrWhiteSpace($DestinationFolder)) {
-                    Write-Host "\nFound $($files.Count) file(s):\n" -ForegroundColor Green
+                    Write-Host "`nFound $($files.Count) file(s):`n" -ForegroundColor Green
                 }
                 else {
-                    Write-Host "\nFound $($files.Count) file(s) that would be moved:\n" -ForegroundColor Green
+                    Write-Host "`nFound $($files.Count) file(s) that would be moved:`n" -ForegroundColor Green
                 }
             }
             else {
-                Write-Host "\nFound $($files.Count) file(s) to move\n" -ForegroundColor Green
+                Write-Host "`nFound $($files.Count) file(s) to move`n" -ForegroundColor Green
             }
             
             $successCount = 0
@@ -636,15 +685,14 @@ function Invoke-MoveFiles {
             return ($failCount -eq 0)
         }
         catch {
-            Write-Host "\n[X] Error searching for files: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "`n[X] Error searching for files: $($_.Exception.Message)" -ForegroundColor Red
             return $false
         }
     }
     else {
-        # Single file
-        # Normalize the source pattern if it's not already a server-relative URL
-        $normalizedSource = Get-NormalizedPath -Path $SourcePattern
-        Write-Verbose "Normalized source file path: $normalizedSource"
+        # Single file - Get-PnPFile needs server-relative path
+        $normalizedSource = Get-ServerRelativePath -Path $SourcePattern
+        Write-Verbose "Normalized source file path (server-relative): $normalizedSource"
         
         try {
             Write-Verbose "Executing: Get-PnPFile -Url $normalizedSource -AsListItem"
@@ -692,7 +740,7 @@ function Invoke-MoveFiles {
             return $result
         }
         catch {
-            Write-Host "\n[X] File not found or error accessing file: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "`n[X] File not found or error accessing file: $($_.Exception.Message)" -ForegroundColor Red
             return $false
         }
     }
@@ -765,7 +813,7 @@ elseif ($MoveFile) {
     # Validate that Destination is provided
     if ([string]::IsNullOrWhiteSpace($Destination)) {
         Write-Host "[X] -Destination parameter is required when using -MoveFile" -ForegroundColor Red
-        Write-Host "\nUsage: .\Move-SPOFiles.ps1 -MoveFile '<source>' -Destination '<destination>'" -ForegroundColor Yellow
+        Write-Host "`nUsage: .\Move-SPOFiles.ps1 -MoveFile '<source>' -Destination '<destination>'" -ForegroundColor Yellow
         exit 1
     }
     
@@ -803,7 +851,7 @@ elseif (-not $Connect) {
     Write-Host "  -ListFiles <pattern>      List files matching pattern" -ForegroundColor Gray
     Write-Host "  -ListFiles <src> -Destination <dest>  Preview files that would be moved (dry run)" -ForegroundColor Gray
     Write-Host "  -Verbose                  Show detailed output including PnP commands" -ForegroundColor Gray
-    Write-Host "\nExamples:" -ForegroundColor Cyan
+    Write-Host "`nExamples:" -ForegroundColor Cyan
     Write-Host "  .\Move-SPOFiles.ps1 -Check" -ForegroundColor White
     Write-Host "  .\Move-SPOFiles.ps1 -Connect 'contoso'" -ForegroundColor White
     Write-Host "  .\Move-SPOFiles.ps1 -Connect 'contoso/mysite'" -ForegroundColor White
