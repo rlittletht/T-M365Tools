@@ -433,9 +433,39 @@ function Move-SPOFileWithPDF {
     )
     
     try {
+        # Validate File object has required properties
+        if ($null -eq $File) {
+            throw "File object is null"
+        }
+        
+        # Ensure ServerRelativeUrl property is loaded (required for CSOM File objects)
+        if ([string]::IsNullOrWhiteSpace($File.ServerRelativeUrl)) {
+            Write-Verbose "ServerRelativeUrl not loaded, attempting to load property..."
+            try {
+                $null = Get-PnPProperty -ClientObject $File -Property ServerRelativeUrl -ErrorAction Stop
+            }
+            catch {
+                Write-Verbose "Could not load ServerRelativeUrl property: $($_.Exception.Message)"
+            }
+        }
+        
+        if ([string]::IsNullOrWhiteSpace($File.Name)) {
+            throw "File.Name is null or empty"
+        }
+        
+        if ([string]::IsNullOrWhiteSpace($File.ServerRelativeUrl)) {
+            throw "File.ServerRelativeUrl is null or empty (property may not be loaded)"
+        }
+        
         $fileName = $File.Name
         $fileServerRelativeUrl = $File.ServerRelativeUrl
-        $fileFolder = $File.ServerRelativeUrl.Substring(0, $File.ServerRelativeUrl.LastIndexOf('/'))
+        
+        # Extract the folder path from the file's server relative URL
+        $lastSlashIndex = $fileServerRelativeUrl.LastIndexOf('/')
+        if ($lastSlashIndex -lt 0) {
+            throw "Invalid file path format: $fileServerRelativeUrl (no folder separator found)"
+        }
+        $fileFolder = $fileServerRelativeUrl.Substring(0, $lastSlashIndex)
         
         # Normalize the destination folder with server-relative path (for Move-PnPFile)
         $normalizedDestination = Get-ServerRelativePath -Path $DestinationFolder
@@ -512,6 +542,9 @@ function Move-SPOFileWithPDF {
     }
     catch {
         Write-Host "    [X] Error moving file: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Verbose "Error details: $($_.Exception.ToString())"
+        Write-Verbose "File Name: $($File.Name)"
+        Write-Verbose "File ServerRelativeUrl: $($File.ServerRelativeUrl)"
         return $false
     }
 }
@@ -640,16 +673,19 @@ function Invoke-MoveFiles {
                     
                     # Check for associated PDF
                     $baseName = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
-                    $fileFolder = $file.ServerRelativeUrl.Substring(0, $file.ServerRelativeUrl.LastIndexOf('/'))
-                    $pdfPath = "$fileFolder/PDF/$baseName.pdf"
-                    try {
-                        Write-Verbose "Executing: Get-PnPFile -Url '$pdfPath'"
-                        $pdfFile = Get-PnPFile -Url $pdfPath -ErrorAction SilentlyContinue
-                        if ($null -ne $pdfFile) {
-                            Write-Host "    [✓] Has associated PDF: $pdfPath" -ForegroundColor Gray
+                    $lastSlashIndex = $file.ServerRelativeUrl.LastIndexOf('/')
+                    if ($lastSlashIndex -ge 0) {
+                        $fileFolder = $file.ServerRelativeUrl.Substring(0, $lastSlashIndex)
+                        $pdfPath = "$fileFolder/PDF/$baseName.pdf"
+                        try {
+                            Write-Verbose "Executing: Get-PnPFile -Url '$pdfPath'"
+                            $pdfFile = Get-PnPFile -Url $pdfPath -ErrorAction SilentlyContinue
+                            if ($null -ne $pdfFile) {
+                                Write-Host "    [✓] Has associated PDF: $pdfPath" -ForegroundColor Gray
+                            }
                         }
+                        catch { }
                     }
-                    catch { }
                     Write-Host ""
                     $successCount++
                 }
@@ -694,10 +730,22 @@ function Invoke-MoveFiles {
         Write-Verbose "Normalized source file path (server-relative): $normalizedSource"
         
         try {
-            Write-Verbose "Executing: Get-PnPFile -Url '$normalizedSource' -AsListItem"
-            $file = Get-PnPFile -Url $normalizedSource -AsListItem -ErrorAction Stop
             Write-Verbose "Executing: Get-PnPFile -Url '$normalizedSource'"
             $fileObj = Get-PnPFile -Url $normalizedSource -ErrorAction Stop
+            
+            if ($null -eq $fileObj) {
+                Write-Host "`n[X] File object is null after retrieval" -ForegroundColor Red
+                return $false
+            }
+            
+            # Explicitly load the ServerRelativeUrl property
+            Write-Verbose "Loading ServerRelativeUrl property..."
+            $null = Get-PnPProperty -ClientObject $fileObj -Property ServerRelativeUrl -ErrorAction Stop
+            
+            Write-Verbose "File retrieved successfully"
+            Write-Verbose "  Type: $($fileObj.GetType().FullName)"
+            Write-Verbose "  Name: $($fileObj.Name)"
+            Write-Verbose "  ServerRelativeUrl: $($fileObj.ServerRelativeUrl)"
             
             Write-Host ""
             
@@ -708,16 +756,19 @@ function Invoke-MoveFiles {
                 
                 # Check for associated PDF
                 $baseName = [System.IO.Path]::GetFileNameWithoutExtension($fileObj.Name)
-                $fileFolder = $fileObj.ServerRelativeUrl.Substring(0, $fileObj.ServerRelativeUrl.LastIndexOf('/'))
-                $pdfPath = "$fileFolder/PDF/$baseName.pdf"
-                try {
-                    Write-Verbose "Executing: Get-PnPFile -Url '$pdfPath'"
-                    $pdfFile = Get-PnPFile -Url $pdfPath -ErrorAction SilentlyContinue
-                    if ($null -ne $pdfFile) {
-                        Write-Host "    [✓] Has associated PDF: $pdfPath" -ForegroundColor Gray
+                $lastSlashIndex = $fileObj.ServerRelativeUrl.LastIndexOf('/')
+                if ($lastSlashIndex -ge 0) {
+                    $fileFolder = $fileObj.ServerRelativeUrl.Substring(0, $lastSlashIndex)
+                    $pdfPath = "$fileFolder/PDF/$baseName.pdf"
+                    try {
+                        Write-Verbose "Executing: Get-PnPFile -Url '$pdfPath'"
+                        $pdfFile = Get-PnPFile -Url $pdfPath -ErrorAction SilentlyContinue
+                        if ($null -ne $pdfFile) {
+                            Write-Host "    [✓] Has associated PDF: $pdfPath" -ForegroundColor Gray
+                        }
                     }
+                    catch { }
                 }
-                catch { }
                 Write-Host ""
                 Write-Host "[✓] File found" -ForegroundColor Green
                 $result = $true
@@ -740,6 +791,8 @@ function Invoke-MoveFiles {
         }
         catch {
             Write-Host "`n[X] File not found or error accessing file: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Verbose "Full error details: $($_.Exception.ToString())"
+            Write-Verbose "Error occurred at: $($_.InvocationInfo.PositionMessage)"
             return $false
         }
     }
