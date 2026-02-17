@@ -652,14 +652,14 @@ function Invoke-MoveFiles {
             
             if ($ListMode) {
                 if ([string]::IsNullOrWhiteSpace($DestinationFolder)) {
-                    Write-Host "`nFound $($files.Count) file(s):`n" -ForegroundColor Green
+                    Write-Host "`nFound $($files.Count) file(s):" -ForegroundColor Green
                 }
                 else {
-                    Write-Host "`nFound $($files.Count) file(s) that would be moved:`n" -ForegroundColor Green
+                    Write-Host "`nFound $($files.Count) file(s) that would be moved:" -ForegroundColor Green
                 }
             }
             else {
-                Write-Host "`nFound $($files.Count) file(s) to move`n" -ForegroundColor Green
+                Write-Host "`nFound $($files.Count) file(s) to move" -ForegroundColor Green
             }
             
             $successCount = 0
@@ -669,7 +669,7 @@ function Invoke-MoveFiles {
                 if ([string]::IsNullOrWhiteSpace($DestinationFolder)) {
                     # Just list the file
                     Write-Host "  $($file.Name)" -ForegroundColor White
-                    Write-Host "    Location: $($file.ServerRelativeUrl)" -ForegroundColor Gray
+                    Write-Verbose "  $($file.ServerRelativeUrl)" 
                     
                     # Check for associated PDF
                     $baseName = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
@@ -686,7 +686,6 @@ function Invoke-MoveFiles {
                         }
                         catch { }
                     }
-                    Write-Host ""
                     $successCount++
                 }
                 else {
