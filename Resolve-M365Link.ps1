@@ -49,6 +49,25 @@
     For example, -TestMax 5 will process at most 5 domain-matching links and verify at most 5 non-matching links.
     Valid range: 1-1000.
 
+.PARAMETER RecheckExternalAfter
+    Number of days before re-checking a previously verified external link (non-domain matching). Default is 7 days.
+    When an external link is verified via HTTP, the result is cached. If the same link is encountered 
+    again within RecheckExternalAfter days, the cached result is used instead of making a new HTTP request.
+    Valid range: 1-365.
+
+.PARAMETER RecheckDomainAfter
+    Number of days before re-resolving a previously processed domain-matching link. Default is 5 days.
+    When a domain link is resolved via Graph API, the result is cached. If the same link is encountered 
+    again within RecheckDomainAfter days, the cached result is used instead of making a new API call.
+    Valid range: 1-365.
+
+.PARAMETER UseCacheFile
+    Path to a JSON file for persistent cache storage. If the file exists, it will be loaded to
+    pre-populate the cache. After processing, the cache will be saved back to this file.
+    The cache stores both Graph API resolution results (for domain-matching links) and HTTP 
+    verification results (for non-matching links when -VerifyAllLinks is used).
+    This allows results to be reused across multiple script runs, significantly reducing API calls.
+
 .PARAMETER All
     Display all file and site information. By default, only the file path is shown.
 
@@ -82,6 +101,15 @@
 .EXAMPLE
     .\Resolve-M365Link.ps1 -Domain "contoso" -InputCsv "data.csv" -OutputCsv "test-output.csv" -UseInteractive -VerifyAllLinks -TestMax 10
     Test mode: Resolves the first 10 contoso links and verifies the first 10 non-matching links.
+
+.EXAMPLE
+    .\Resolve-M365Link.ps1 -Domain "contoso" -InputCsv "data.csv" -OutputCsv "data-resolved.csv" -UseInteractive -VerifyAllLinks -UseCacheFile "link-cache.json"
+    Resolves matching links and verifies non-matching links, saving all results to a cache file. On subsequent runs, 
+    cached resolutions (within RecheckDomainAfter threshold) and verifications (within RecheckExternalAfter threshold) are reused.
+
+.EXAMPLE
+    .\Resolve-M365Link.ps1 -Domain "contoso" -InputCsv "data.csv" -OutputCsv "data-resolved.csv" -UseInteractive -VerifyAllLinks -UseCacheFile "link-cache.json" -RecheckDomainAfter 2 -RecheckExternalAfter 30
+    Uses a 2-day cache for domain links and 30-day cache for external links. Domain links processed within 2 days use cached results; external links verified within 30 days use cached results.
 
 .NOTES
     Requires Microsoft.Graph PowerShell module.
@@ -137,6 +165,17 @@ param(
     [int]$TestMax,
     
     [Parameter(Mandatory = $false)]
+    [ValidateRange(1, 365)]
+    [int]$RecheckExternalAfter = 7,
+    
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(1, 365)]
+    [int]$RecheckDomainAfter = 5,
+    
+    [Parameter(Mandatory = $false)]
+    [string]$UseCacheFile,
+    
+    [Parameter(Mandatory = $false)]
     [switch]$All
 )
 
@@ -175,49 +214,224 @@ catch {
     exit 1
 }
 
-# Function to verify if a link is accessible
-function Test-LinkValidity {
+# Function to canonicalize URLs for consistent cache lookups
+function Get-CanonicalUrl {
     param(
         [string]$Url
     )
     
+    if ([string]::IsNullOrWhiteSpace($Url)) {
+        return $Url
+    }
+    
+    # Normalize the URL
+    $canonical = $Url.Trim()
+    
+    # Encode spaces as %20 (in case they're encoded differently or not at all)
+    $canonical = $canonical.Replace(' ', '%20')
+    
+    # Remove trailing slash (but preserve if it's just the protocol://domain/)
+    if ($canonical -match '^(https?://[^/]+)/$') {
+        # Don't remove trailing slash if it's just protocol://domain/
+        # Keep as is
+    }
+    elseif ($canonical.EndsWith('/')) {
+        # Remove trailing slash from paths
+        $canonical = $canonical.TrimEnd('/')
+    }
+    
+    return $canonical
+}
+
+# Function to verify if a link is accessible
+function Test-LinkValidity {
+    param(
+        [string]$Url,
+        [hashtable]$Cache,
+        [int]$RecheckAfterDays = 5
+    )
+    
+    # Canonicalize URL for consistent cache lookups
+    $canonicalUrl = Get-CanonicalUrl -Url $Url
+    
+    # Check cache first using canonical URL
+    if ($Cache.ContainsKey($canonicalUrl)) {
+        $cachedEntry = $Cache[$canonicalUrl]
+        $daysSinceCheck = (Get-Date) - $cachedEntry.LastChecked
+        
+        if ($daysSinceCheck.TotalDays -lt $RecheckAfterDays) {
+            # Cache is still valid, return cached result
+            Write-Verbose "Using cached result for: $canonicalUrl (checked $([math]::Round($daysSinceCheck.TotalDays, 1)) days ago)"
+            return @{
+                IsValid = $cachedEntry.IsValid
+                Status = $cachedEntry.Status + " (cached)"
+                StatusCode = $cachedEntry.StatusCode
+                FromCache = $true
+            }
+        }
+        else {
+            Write-Verbose "Cache expired for: $canonicalUrl (checked $([math]::Round($daysSinceCheck.TotalDays, 1)) days ago, threshold: $RecheckAfterDays days)"
+        }
+    }
+    
+    # Not in cache or cache expired, verify the link
+    $result = $null
+    
     try {
         # Try to get the headers with a HEAD request (faster than GET)
-        $response = Invoke-WebRequest -Uri $Url -Method Head -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
-        return @{
+        $response = Invoke-WebRequest -Uri $canonicalUrl -Method Head -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+        $result = @{
             IsValid = $true
             Status = "Valid (HTTP $($response.StatusCode))"
             StatusCode = $response.StatusCode
+            FromCache = $false
         }
     }
     catch {
         # If HEAD fails, try GET (some servers don't support HEAD)
         try {
-            $response = Invoke-WebRequest -Uri $Url -Method Get -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
-            return @{
+            $response = Invoke-WebRequest -Uri $canonicalUrl -Method Get -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+            $result = @{
                 IsValid = $true
                 Status = "Valid (HTTP $($response.StatusCode))"
                 StatusCode = $response.StatusCode
+                FromCache = $false
             }
         }
         catch {
             $errorMsg = $_.Exception.Message
             if ($_.Exception.Response) {
                 $statusCode = [int]$_.Exception.Response.StatusCode
-                return @{
+                $result = @{
                     IsValid = $false
                     Status = "Failed (HTTP $statusCode)"
                     StatusCode = $statusCode
+                    FromCache = $false
                 }
             }
             else {
-                return @{
+                $result = @{
                     IsValid = $false
                     Status = "Failed: $($errorMsg.Substring(0, [Math]::Min(50, $errorMsg.Length)))"
                     StatusCode = $null
+                    FromCache = $false
                 }
             }
         }
+    }
+    
+    # Update cache with the new result using canonical URL
+    $Cache[$canonicalUrl] = @{
+        Type = 'Verification'
+        IsValid = $result.IsValid
+        Status = $result.Status
+        StatusCode = $result.StatusCode
+        LastChecked = Get-Date
+    }
+    
+    return $result
+}
+
+# Function to load verification cache from file
+function Import-VerificationCache {
+    param(
+        [string]$Path
+    )
+    
+    if (-not (Test-Path $Path)) {
+        Write-Verbose "Cache file not found: $Path (will be created on save)"
+        return @{}
+    }
+    
+    try {
+        Write-Host "Loading verification cache from: $Path" -ForegroundColor Cyan
+        $jsonContent = Get-Content -Path $Path -Raw -ErrorAction Stop
+        $cacheData = $jsonContent | ConvertFrom-Json -ErrorAction Stop
+        
+        # Convert JSON object back to hashtable with proper types
+        $cache = @{}
+        foreach ($property in $cacheData.PSObject.Properties) {
+            $url = $property.Name
+            $entry = $property.Value
+            
+            $cacheEntry = @{
+                LastChecked = [DateTime]::Parse($entry.LastChecked)
+            }
+            
+            # Determine cache entry type and restore appropriate fields
+            if ($entry.PSObject.Properties.Name -contains 'WebUrl') {
+                # This is a Graph API resolution result
+                $cacheEntry.Type = 'Resolution'
+                $cacheEntry.WebUrl = $entry.WebUrl
+                $cacheEntry.Name = $entry.Name
+                $cacheEntry.Status = $entry.Status
+            }
+            else {
+                # This is an HTTP verification result
+                $cacheEntry.Type = 'Verification'
+                $cacheEntry.IsValid = $entry.IsValid
+                $cacheEntry.Status = $entry.Status
+                $cacheEntry.StatusCode = $entry.StatusCode
+            }
+            
+            $cache[$url] = $cacheEntry
+        }
+        
+        Write-Host "Loaded $($cache.Count) cached result(s)" -ForegroundColor Green
+        return $cache
+    }
+    catch {
+        Write-Warning "Failed to load cache file: $($_.Exception.Message)"
+        Write-Warning "Starting with empty cache"
+        return @{}
+    }
+}
+
+# Function to save verification cache to file
+function Export-VerificationCache {
+    param(
+        [hashtable]$Cache,
+        [string]$Path
+    )
+    
+    if ($Cache.Count -eq 0) {
+        Write-Verbose "Cache is empty, skipping save"
+        return
+    }
+    
+    try {
+        # Convert hashtable to JSON-friendly format
+        $cacheObject = @{}
+        foreach ($key in $Cache.Keys) {
+            $entry = $Cache[$key]
+            
+            # Build cache entry based on type
+            if ($entry.Type -eq 'Resolution') {
+                $cacheObject[$key] = @{
+                    WebUrl = $entry.WebUrl
+                    Name = $entry.Name
+                    Status = $entry.Status
+                    LastChecked = $entry.LastChecked.ToString('o')
+                }
+            }
+            else {
+                # Verification type
+                $cacheObject[$key] = @{
+                    IsValid = $entry.IsValid
+                    Status = $entry.Status
+                    StatusCode = $entry.StatusCode
+                    LastChecked = $entry.LastChecked.ToString('o')
+                }
+            }
+        }
+        
+        $jsonContent = $cacheObject | ConvertTo-Json -Depth 10
+        $jsonContent | Set-Content -Path $Path -Encoding UTF8 -ErrorAction Stop
+        
+        Write-Host "Saved verification cache to: $Path ($($Cache.Count) entries)" -ForegroundColor Green
+    }
+    catch {
+        Write-Warning "Failed to save cache file: $($_.Exception.Message)"
     }
 }
 
@@ -444,6 +658,12 @@ if ($originalLinkCount -ne $linksToProcess.Count) {
     Write-Host "Processing $($linksToProcess.Count) of $originalLinkCount link(s) matching domain '$Domain'" -ForegroundColor Green
 }
 
+# Load verification cache if UseCacheFile is specified
+$verificationCache = @{}
+if ($UseCacheFile) {
+    $verificationCache = Import-VerificationCache -Path $UseCacheFile
+}
+
 try {
     # Authenticate to Microsoft Graph
     Write-Host "Authenticating to Microsoft Graph..." -ForegroundColor Cyan
@@ -537,6 +757,7 @@ try {
     $results = @()
     $skippedResults = @()
     $linkIndex = 0
+    $cachedResolutionCount = 0
     
     # Add skipped links to results for CSV mode
     if ($isCsvMode) {
@@ -549,7 +770,7 @@ try {
             if ($VerifyAllLinks) {
                 $verifyIndex++
                 Write-Host "[$verifyIndex/$($skippedLinks.Count)] Verifying: $skippedLink" -ForegroundColor Gray
-                $verifyResult = Test-LinkValidity -Url $skippedLink
+                $verifyResult = Test-LinkValidity -Url $skippedLink -Cache $verificationCache -RecheckAfterDays $RecheckExternalAfter
                 
                 $skippedResults += [PSCustomObject]@{
                     Link = $skippedLink
@@ -572,7 +793,11 @@ try {
         if ($VerifyAllLinks -and $skippedLinks.Count -gt 0) {
             $validCount = ($skippedResults | Where-Object { $_.LinkStatus -like "Valid*" }).Count
             $failedCount = ($skippedResults | Where-Object { $_.LinkStatus -like "Failed*" }).Count
+            $cachedCount = ($skippedResults | Where-Object { $_.LinkStatus -like "*(cached)" }).Count
             Write-Host "Verification complete: $validCount valid, $failedCount failed" -ForegroundColor Cyan
+            if ($cachedCount -gt 0) {
+                Write-Host "  ($cachedCount result(s) from cache, re-check threshold: $RecheckExternalAfter day(s))" -ForegroundColor Gray
+            }
         }
     }
     
@@ -586,22 +811,63 @@ try {
             Write-Host "Resolving sharing link..." -ForegroundColor Cyan
         }
         
+        # Check cache for this link first
+        $canonicalLink = Get-CanonicalUrl -Url $currentLink
+        $cachedResult = $null
+        $usedCache = $false
+        
+        if ($verificationCache.ContainsKey($canonicalLink)) {
+            $cachedEntry = $verificationCache[$canonicalLink]
+            if ($cachedEntry.Type -eq 'Resolution') {
+                $daysSinceCheck = (Get-Date) - $cachedEntry.LastChecked
+                
+                if ($daysSinceCheck.TotalDays -lt $RecheckDomainAfter) {
+                    # Cache is still valid, use cached result
+                    Write-Verbose "Using cached resolution for: $canonicalLink (resolved $([math]::Round($daysSinceCheck.TotalDays, 1)) days ago)"
+                    $usedCache = $true
+                    $cachedResolutionCount++
+                    $cachedResult = @{
+                        webUrl = $cachedEntry.WebUrl
+                        name = $cachedEntry.Name
+                    }
+                }
+                else {
+                    Write-Verbose "Cache expired for: $canonicalLink (resolved $([math]::Round($daysSinceCheck.TotalDays, 1)) days ago, threshold: $RecheckDomainAfter days)"
+                }
+            }
+        }
+        
         try {
-            # Encode the sharing link for the Graph API
-            # The sharing link needs to be base64-encoded and URL-safe
-            $encodedUrl = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($currentLink))
-            # Make it URL-safe by replacing characters
-            $encodedUrl = $encodedUrl.TrimEnd('=').Replace('/', '_').Replace('+', '-')
-            $shareId = "u!$encodedUrl"
-            
-            # Call Microsoft Graph API to get the shared item
-            $uri = "https://graph.microsoft.com/v1.0/shares/$shareId/driveItem"
-            
-            $response = Invoke-MgGraphRequest -Uri $uri -Method GET
+            if ($usedCache) {
+                # Use cached response
+                $response = $cachedResult
+            }
+            else {
+                # Encode the sharing link for the Graph API
+                # The sharing link needs to be base64-encoded and URL-safe
+                $encodedUrl = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($currentLink))
+                # Make it URL-safe by replacing characters
+                $encodedUrl = $encodedUrl.TrimEnd('=').Replace('/', '_').Replace('+', '-')
+                $shareId = "u!$encodedUrl"
+                
+                # Call Microsoft Graph API to get the shared item
+                $uri = "https://graph.microsoft.com/v1.0/shares/$shareId/driveItem"
+                
+                $response = Invoke-MgGraphRequest -Uri $uri -Method GET
+                
+                # Cache the successful resolution
+                $verificationCache[$canonicalLink] = @{
+                    Type = 'Resolution'
+                    WebUrl = $response.webUrl
+                    Name = $response.name
+                    Status = 'Success'
+                    LastChecked = Get-Date
+                }
+            }
     
-    # Construct the full path
+    # Construct the full path - only if not using cached data
     $fullPath = ""
-    if ($response.parentReference) {
+    if (-not $usedCache -and $response.parentReference) {
         $siteId = $response.parentReference.siteId
         $driveId = $response.parentReference.driveId
         $itemId = $response.id
@@ -709,7 +975,12 @@ try {
             }
             else {
                 # Show only the web URL
-                Write-Host $response.webUrl
+                if ($usedCache) {
+                    Write-Host "$($response.webUrl) (cached)" -ForegroundColor Gray
+                }
+                else {
+                    Write-Host $response.webUrl
+                }
             }
         }
         catch {
@@ -741,6 +1012,9 @@ try {
         Write-Host "Total links processed: $($results.Count)" -ForegroundColor White
         Write-Host "Successful: $(($results | Where-Object { $_.Status -eq 'Success' }).Count)" -ForegroundColor Green
         Write-Host "Failed: $(($results | Where-Object { $_.Status -ne 'Success' }).Count)" -ForegroundColor Red
+        if ($cachedResolutionCount -gt 0) {
+            Write-Host "  ($cachedResolutionCount resolution(s) from cache, re-check threshold: $RecheckDomainAfter day(s))" -ForegroundColor Gray
+        }
         
         # Export to CSV if OutputFile is specified (InputList mode)
         if ($OutputFile) {
@@ -873,6 +1147,11 @@ catch {
     exit 1
 }
 finally {
+    # Save verification cache if UseCacheFile is specified
+    if ($UseCacheFile -and $verificationCache -and $verificationCache.Count -gt 0) {
+        Export-VerificationCache -Cache $verificationCache -Path $UseCacheFile
+    }
+    
     # Disconnect from Microsoft Graph if connected
     $context = Get-MgContext
     if ($context) {
