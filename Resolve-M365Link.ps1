@@ -65,6 +65,12 @@
 .NOTES
     Requires Microsoft.Graph PowerShell module.
     For app-only authentication, the app needs Files.Read.All or Sites.Read.All permissions.
+    
+    Troubleshooting:
+    - If you get "Microsoft.Identity.Client" errors with -UseInteractive, try:
+      1. Update the module: Update-Module Microsoft.Graph -Force
+      2. Restart PowerShell
+      3. Or use -UseAzCli instead (requires: az login)
 #>
 
 [CmdletBinding()]
@@ -313,11 +319,24 @@ try {
             Connect-MgGraph -Scopes "Files.Read.All", "Sites.Read.All" -NoWelcome -ErrorAction Stop
         }
         catch {
-            Write-Error "Interactive authentication failed: $_"
+            $errorMessage = $_.Exception.Message
+            Write-Error "Interactive authentication failed: $errorMessage"
             Write-Host "`nTroubleshooting tips:" -ForegroundColor Yellow
-            Write-Host "1. Make sure you have a web browser available" -ForegroundColor Cyan
-            Write-Host "2. Try using -UseAzCli instead (run 'az login' first)" -ForegroundColor Cyan
-            Write-Host "3. Check if you have the required permissions in your tenant`n" -ForegroundColor Cyan
+            
+            # Check for specific Microsoft.Identity.Client error
+            if ($errorMessage -like "*Microsoft.Identity.Client*" -or $errorMessage -like "*IMsalSFHttpClientFactory*") {
+                Write-Host "1. This appears to be a module version compatibility issue." -ForegroundColor Cyan
+                Write-Host "   Try updating the Microsoft.Graph module:" -ForegroundColor Cyan
+                Write-Host "   Update-Module Microsoft.Graph -Force" -ForegroundColor White
+                Write-Host "   Then restart PowerShell and try again`n" -ForegroundColor Cyan
+                Write-Host "2. Alternatively, try using -UseAzCli instead (run 'az login' first)" -ForegroundColor Cyan
+            }
+            else {
+                Write-Host "1. Make sure you have a web browser available" -ForegroundColor Cyan
+                Write-Host "2. Try using -UseAzCli instead (run 'az login' first)" -ForegroundColor Cyan
+                Write-Host "3. Check if you have the required permissions in your tenant" -ForegroundColor Cyan
+            }
+            Write-Host ""
             exit 1
         }
     }
@@ -645,6 +664,9 @@ catch {
     exit 1
 }
 finally {
-    # Disconnect from Microsoft Graph
-    Disconnect-MgGraph | Out-Null
+    # Disconnect from Microsoft Graph if connected
+    $context = Get-MgContext
+    if ($context) {
+        Disconnect-MgGraph | Out-Null
+    }
 }
