@@ -40,6 +40,15 @@
 .PARAMETER UseAzCli
     Use Azure CLI credentials (requires 'az login' to be run first).
 
+.PARAMETER VerifyAllLinks
+    Verify that links not matching the domain are still valid by attempting to access them.
+    This adds a "Link Status" column showing whether each non-matching link is accessible.
+
+.PARAMETER TestMax
+    Limit processing to the first N matching links and first N non-matching links (for testing).
+    For example, -TestMax 5 will process at most 5 domain-matching links and verify at most 5 non-matching links.
+    Valid range: 1-1000.
+
 .PARAMETER All
     Display all file and site information. By default, only the file path is shown.
 
@@ -61,6 +70,18 @@
 
 .EXAMPLE
     .\Resolve-M365Link.ps1 -Domain "contoso" -InputCsv "data.csv" -OutputCsv "data-resolved.csv" -UseInteractive
+
+.EXAMPLE
+    .\Resolve-M365Link.ps1 -Domain "contoso" -InputCsv "data.csv" -OutputCsv "data-resolved.csv" -UseInteractive -VerifyAllLinks
+    Resolves contoso links and verifies all other links for validity.
+
+.EXAMPLE
+    .\Resolve-M365Link.ps1 -Domain "contoso" -InputCsv "data.csv" -OutputCsv "test-output.csv" -UseInteractive -TestMax 5
+    Test mode: Resolves only the first 5 contoso links and skips verification of other links.
+
+.EXAMPLE
+    .\Resolve-M365Link.ps1 -Domain "contoso" -InputCsv "data.csv" -OutputCsv "test-output.csv" -UseInteractive -VerifyAllLinks -TestMax 10
+    Test mode: Resolves the first 10 contoso links and verifies the first 10 non-matching links.
 
 .NOTES
     Requires Microsoft.Graph PowerShell module.
@@ -109,6 +130,13 @@ param(
     [switch]$UseAzCli,
     
     [Parameter(Mandatory = $false)]
+    [switch]$VerifyAllLinks,
+    
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(1, 1000)]
+    [int]$TestMax,
+    
+    [Parameter(Mandatory = $false)]
     [switch]$All
 )
 
@@ -145,6 +173,119 @@ catch {
         Write-Error "Failed to import Microsoft.Graph.Authentication module: $_"
     }
     exit 1
+}
+
+# Function to verify if a link is accessible
+function Test-LinkValidity {
+    param(
+        [string]$Url
+    )
+    
+    try {
+        # Try to get the headers with a HEAD request (faster than GET)
+        $response = Invoke-WebRequest -Uri $Url -Method Head -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+        return @{
+            IsValid = $true
+            Status = "Valid (HTTP $($response.StatusCode))"
+            StatusCode = $response.StatusCode
+        }
+    }
+    catch {
+        # If HEAD fails, try GET (some servers don't support HEAD)
+        try {
+            $response = Invoke-WebRequest -Uri $Url -Method Get -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+            return @{
+                IsValid = $true
+                Status = "Valid (HTTP $($response.StatusCode))"
+                StatusCode = $response.StatusCode
+            }
+        }
+        catch {
+            $errorMsg = $_.Exception.Message
+            if ($_.Exception.Response) {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+                return @{
+                    IsValid = $false
+                    Status = "Failed (HTTP $statusCode)"
+                    StatusCode = $statusCode
+                }
+            }
+            else {
+                return @{
+                    IsValid = $false
+                    Status = "Failed: $($errorMsg.Substring(0, [Math]::Min(50, $errorMsg.Length)))"
+                    StatusCode = $null
+                }
+            }
+        }
+    }
+}
+
+# Function to export CSV with retry logic
+function Export-CsvWithRetry {
+    param(
+        [Parameter(Mandatory=$true)]
+        [object[]]$Data,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$Path,
+        
+        [Parameter(Mandatory=$false)]
+        [string]$Description = "results"
+    )
+    
+    $currentPath = $Path
+    $success = $false
+    
+    while (-not $success) {
+        try {
+            $Data | Export-Csv -Path $currentPath -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+            $success = $true
+            Write-Host "`n$Description exported to: $currentPath" -ForegroundColor Green
+            return $currentPath
+        }
+        catch {
+            Write-Host "`nFailed to export $Description to: $currentPath" -ForegroundColor Red
+            Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-Host "`nPossible issues:" -ForegroundColor Cyan
+            Write-Host "  - File may be open in another program (close it and try again)" -ForegroundColor Gray
+            Write-Host "  - Directory may not exist or you may not have write permissions" -ForegroundColor Gray
+            Write-Host "  - Path may be invalid" -ForegroundColor Gray
+            
+            Write-Host "`nOptions:" -ForegroundColor Cyan
+            Write-Host "  [R] Retry with the same path" -ForegroundColor White
+            Write-Host "  [N] Provide a new path" -ForegroundColor White
+            Write-Host "  [S] Skip and continue without saving" -ForegroundColor White
+            
+            $choice = Read-Host "`nYour choice (R/N/S)"
+            
+            switch ($choice.ToUpper()) {
+                "R" {
+                    Write-Host "Retrying..." -ForegroundColor Cyan
+                    continue
+                }
+                "N" {
+                    $newPath = Read-Host "Enter new file path"
+                    if ([string]::IsNullOrWhiteSpace($newPath)) {
+                        Write-Host "Invalid path. Retrying with original path..." -ForegroundColor Yellow
+                    }
+                    else {
+                        $currentPath = $newPath
+                        Write-Host "Attempting to save to: $currentPath" -ForegroundColor Cyan
+                    }
+                    continue
+                }
+                "S" {
+                    Write-Warning "Skipping export. Results will not be saved to file."
+                    return $null
+                }
+                default {
+                    Write-Host "Invalid choice. Please enter R, N, or S." -ForegroundColor Yellow
+                    continue
+                }
+            }
+        }
+    }
 }
 
 # Validate parameters
@@ -274,6 +415,31 @@ if ($linksToProcess.Count -eq 0) {
     exit 1
 }
 
+# Apply TestMax limiting if specified
+if ($TestMax -gt 0) {
+    $originalMatchingCount = $linksToProcess.Count
+    $originalSkippedCount = $skippedLinks.Count
+    
+    Write-Host "`nTest mode enabled: Limiting to first $TestMax link(s) per category" -ForegroundColor Cyan
+    
+    if ($linksToProcess.Count -gt $TestMax) {
+        $linksToProcess = $linksToProcess | Select-Object -First $TestMax
+        Write-Host "  - Limited matching links from $originalMatchingCount to $TestMax" -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "  - Processing all $($linksToProcess.Count) matching link(s) (less than $TestMax)" -ForegroundColor Gray
+    }
+    
+    if ($skippedLinks.Count -gt $TestMax) {
+        $skippedLinks = $skippedLinks | Select-Object -First $TestMax
+        Write-Host "  - Limited non-matching links from $originalSkippedCount to $TestMax" -ForegroundColor Yellow
+    }
+    elseif ($skippedLinks.Count -gt 0) {
+        Write-Host "  - Processing all $($skippedLinks.Count) non-matching link(s) (less than $TestMax)" -ForegroundColor Gray
+    }
+    Write-Host ""
+}
+
 if ($originalLinkCount -ne $linksToProcess.Count) {
     Write-Host "Processing $($linksToProcess.Count) of $originalLinkCount link(s) matching domain '$Domain'" -ForegroundColor Green
 }
@@ -374,13 +540,39 @@ try {
     
     # Add skipped links to results for CSV mode
     if ($isCsvMode) {
+        if ($VerifyAllLinks -and $skippedLinks.Count -gt 0) {
+            Write-Host "`nVerifying $($skippedLinks.Count) non-matching link(s)..." -ForegroundColor Cyan
+            $verifyIndex = 0
+        }
+        
         foreach ($skippedLink in $skippedLinks) {
-            $skippedResults += [PSCustomObject]@{
-                Link = $skippedLink
-                WebUrl = "SKIPPED"
-                Name = "N/A"
-                Status = "Skipped: Domain mismatch"
+            if ($VerifyAllLinks) {
+                $verifyIndex++
+                Write-Host "[$verifyIndex/$($skippedLinks.Count)] Verifying: $skippedLink" -ForegroundColor Gray
+                $verifyResult = Test-LinkValidity -Url $skippedLink
+                
+                $skippedResults += [PSCustomObject]@{
+                    Link = $skippedLink
+                    WebUrl = "NOT RESOLVED"
+                    Name = "N/A"
+                    Status = "Domain mismatch"
+                    LinkStatus = $verifyResult.Status
+                }
             }
+            else {
+                $skippedResults += [PSCustomObject]@{
+                    Link = $skippedLink
+                    WebUrl = "SKIPPED"
+                    Name = "N/A"
+                    Status = "Skipped: Domain mismatch"
+                }
+            }
+        }
+        
+        if ($VerifyAllLinks -and $skippedLinks.Count -gt 0) {
+            $validCount = ($skippedResults | Where-Object { $_.LinkStatus -like "Valid*" }).Count
+            $failedCount = ($skippedResults | Where-Object { $_.LinkStatus -like "Failed*" }).Count
+            Write-Host "Verification complete: $validCount valid, $failedCount failed" -ForegroundColor Cyan
         }
     }
     
@@ -552,13 +744,7 @@ try {
         
         # Export to CSV if OutputFile is specified (InputList mode)
         if ($OutputFile) {
-            try {
-                $results | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
-                Write-Host "`nResults exported to: $OutputFile" -ForegroundColor Green
-            }
-            catch {
-                Write-Warning "Failed to export results to CSV: $_"
-            }
+            Export-CsvWithRetry -Data $results -Path $OutputFile -Description "Results"
         }
         
         # Export to CSV with original data if OutputCsv is specified (InputCsv mode)
@@ -589,6 +775,7 @@ try {
                 $hasWebUrl = $firstRow.PSObject.Properties.Name -contains "Web URL"
                 $hasName = $firstRow.PSObject.Properties.Name -contains "Name"
                 $hasStatus = $firstRow.PSObject.Properties.Name -contains "Status"
+                $hasLinkStatus = $firstRow.PSObject.Properties.Name -contains "Link Status"
                 
                 for ($i = 0; $i -lt $csvData.Count; $i++) {
                     $originalRow = $csvData[$i]
@@ -611,6 +798,15 @@ try {
                             # Update existing Status column
                             $newRow | Add-Member -MemberType NoteProperty -Name $prop.Name -Value $resultRow.Status
                         }
+                        elseif ($prop.Name -eq "Link Status") {
+                            # Update existing Link Status column (if VerifyAllLinks is used)
+                            if ($VerifyAllLinks -and $resultRow.PSObject.Properties.Name -contains "LinkStatus") {
+                                $newRow | Add-Member -MemberType NoteProperty -Name $prop.Name -Value $resultRow.LinkStatus
+                            }
+                            else {
+                                $newRow | Add-Member -MemberType NoteProperty -Name $prop.Name -Value $prop.Value
+                            }
+                        }
                         else {
                             # Copy original value
                             $newRow | Add-Member -MemberType NoteProperty -Name $prop.Name -Value $prop.Value
@@ -627,21 +823,34 @@ try {
                     if (-not $hasStatus) {
                         $newRow | Add-Member -MemberType NoteProperty -Name "Status" -Value $resultRow.Status
                     }
+                    if (-not $hasLinkStatus -and $VerifyAllLinks) {
+                        # Add Link Status column if VerifyAllLinks is enabled
+                        if ($resultRow.PSObject.Properties.Name -contains "LinkStatus") {
+                            $newRow | Add-Member -MemberType NoteProperty -Name "Link Status" -Value $resultRow.LinkStatus
+                        }
+                        else {
+                            # For resolved links, leave Link Status empty
+                            $newRow | Add-Member -MemberType NoteProperty -Name "Link Status" -Value ""
+                        }
+                    }
                     
                     $enrichedData += $newRow
                 }
                 
-                $enrichedData | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
+                # Determine description for export
+                $exportDescription = if ($InputCsv -eq $OutputCsv) { "CSV file (in-place update)" } else { "Enriched results" }
                 
-                if ($InputCsv -eq $OutputCsv) {
-                    Write-Host "`nCSV file updated in-place: $OutputCsv" -ForegroundColor Green
-                }
-                else {
-                    Write-Host "`nEnriched results exported to: $OutputCsv" -ForegroundColor Green
+                # Export with retry logic
+                $finalPath = Export-CsvWithRetry -Data $enrichedData -Path $OutputCsv -Description $exportDescription
+                
+                # Update OutputCsv variable in case user provided a new path
+                if ($finalPath -and $finalPath -ne $OutputCsv) {
+                    Write-Host "Note: File was saved to a different location than originally specified." -ForegroundColor Yellow
+                    $OutputCsv = $finalPath
                 }
             }
             catch {
-                Write-Warning "Failed to export enriched results to CSV: $_"
+                Write-Warning "Failed to prepare enriched results: $_"
             }
         }
         
