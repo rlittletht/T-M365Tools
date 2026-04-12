@@ -36,11 +36,14 @@
 .PARAMETER MoveFile
     The source file or pattern to move. Must include the folder path.
     Examples: "Shared Documents/file.docx" or "Shared Documents/*Training*.docx"
-    If -Destination is omitted, simply lists the matching files.
-    If -Destination is specified, moves the files (or shows what would be moved with -Test).
+    Requires -Destination parameter.
 
 .PARAMETER Destination
-    The destination folder path where the file(s) will be moved. Optional - if omitted, files are listed only.
+    The destination folder path where the file(s) will be moved. Required when -MoveFile is specified.
+
+.PARAMETER List
+    Lists files matching the specified pattern without moving them. Must include the folder path.
+    Examples: "Shared Documents/Rules*.*" or "Documents/Subfolder/*.docx"
 
 .PARAMETER Test
     Performs a dry run - shows what would be moved without actually moving files.
@@ -80,7 +83,7 @@
     Moves all files matching the pattern to the Training folder, including associated PDFs.
 
 .EXAMPLE
-    .\Move-SPOFiles.ps1 -MoveFile "Shared Documents/*Training*.docx"
+    .\Move-SPOFiles.ps1 -List "Shared Documents/*Training*.docx"
     Lists all files matching the pattern without moving them.
 
 .EXAMPLE
@@ -110,6 +113,9 @@ param(
     
     [Parameter(Mandatory=$false)]
     [string]$Destination,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$List,
     
     [Parameter(Mandatory=$false)]
     [switch]$Test
@@ -844,7 +850,7 @@ if ($Connect) {
     Write-Host "`n[✓] Connection successful! You can now use PnP cmdlets." -ForegroundColor Green
     
     # If no other actions specified, exit successfully
-    if (-not $Check -and -not $MoveFile) {
+    if (-not $Check -and -not $MoveFile -and -not $List) {
         exit 0
     }
 }
@@ -861,12 +867,16 @@ if ($Check) {
     }
 }
 elseif ($MoveFile) {
-    # Determine if we're in list mode (no destination), test mode (-Test flag), or move mode
+    # Validate that Destination is provided
     if ([string]::IsNullOrWhiteSpace($Destination)) {
-        # Just list files
-        $result = Invoke-MoveFiles -SourcePattern $MoveFile -ListMode
+        Write-Host "[X] -Destination parameter is required when using -MoveFile" -ForegroundColor Red
+        Write-Host "`nUsage: .\Move-SPOFiles.ps1 -MoveFile '<source>' -Destination '<destination>'" -ForegroundColor Yellow
+        Write-Host "To list files, use: .\Move-SPOFiles.ps1 -List '<pattern>'" -ForegroundColor Yellow
+        exit 1
     }
-    elseif ($Test) {
+    
+    # Determine if we're in test mode (-Test flag) or move mode
+    if ($Test) {
         # Dry run - show what would be moved
         $result = Invoke-MoveFiles -SourcePattern $MoveFile -DestinationFolder $Destination -ListMode
     }
@@ -882,12 +892,23 @@ elseif ($MoveFile) {
         exit 1
     }
 }
+elseif ($List) {
+    # List files matching pattern
+    $result = Invoke-MoveFiles -SourcePattern $List -ListMode
+    
+    if ($result) {
+        exit 0
+    }
+    else {
+        exit 1
+    }
+}
 elseif (-not $Connect) {
     # Only show help if no parameters were provided at all
     Write-Host "No action specified. Available options:" -ForegroundColor Yellow
     Write-Host "  -Check                    Verify environment setup" -ForegroundColor Gray
     Write-Host "  -Connect <tenant|tenant/site|url>   Connect to a SharePoint site" -ForegroundColor Gray
-    Write-Host "  -MoveFile <pattern>       List files matching pattern" -ForegroundColor Gray
+    Write-Host "  -List <pattern>           List files matching pattern" -ForegroundColor Gray
     Write-Host "  -MoveFile <src> -Destination <dest>   Move file(s) to destination" -ForegroundColor Gray
     Write-Host "  -MoveFile <src> -Destination <dest> -Test   Preview files that would be moved (dry run)" -ForegroundColor Gray
     Write-Host "  -Verbose                  Show detailed output including PnP commands" -ForegroundColor Gray
@@ -897,7 +918,7 @@ elseif (-not $Connect) {
     Write-Host "  .\Move-SPOFiles.ps1 -Connect 'contoso/mysite'" -ForegroundColor White
     Write-Host "  .\Move-SPOFiles.ps1 -Connect 'https://contoso.sharepoint.com/mysite'" -ForegroundColor White
     Write-Host "  .\Move-SPOFiles.ps1 -Connect 'contoso/mysite' -Check" -ForegroundColor White
-    Write-Host "  .\Move-SPOFiles.ps1 -MoveFile 'Shared Documents/*Training*.docx'" -ForegroundColor White
+    Write-Host "  .\Move-SPOFiles.ps1 -List 'Shared Documents/*Training*.docx'" -ForegroundColor White
     Write-Host "  .\Move-SPOFiles.ps1 -MoveFile 'Shared Documents/file.docx' -Destination 'Shared Documents/Archive'" -ForegroundColor White
     Write-Host "  .\Move-SPOFiles.ps1 -Connect 'contoso/mysite' -MoveFile 'Shared Documents/*Training*.docx' -Destination 'Shared Documents/Training'" -ForegroundColor White
     Write-Host "  .\Move-SPOFiles.ps1 -MoveFile 'Shared Documents/*Training*.docx' -Destination 'Shared Documents/Training' -Test" -ForegroundColor White
