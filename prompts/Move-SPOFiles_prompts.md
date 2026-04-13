@@ -138,6 +138,61 @@ The script's key feature was maintaining the association between files and their
 
 ---
 
+### 2. Add Azure Blob Management on Move
+**Date:** April 12, 2026
+
+**Prompt:** "when performing a move for a matching PDF file, if azure is specified, copy the item from the old location to the new location in the container. if the optional 'DeleteOldAzureBlobs' is specified, delete the old azure blob."
+
+**Requirements:**
+- When moving PDF files, also copy corresponding Azure blobs to new locations
+- Add `-DeleteOldAzureBlobs` switch parameter to optionally delete old blobs after copying
+- Only applies during actual moves (not -List or -Test modes)
+
+**Implementation:**
+- Added `-DeleteOldAzureBlobs` switch parameter
+- Added script-level variable `$script:DeleteOldAzureBlobs` to track deletion mode
+- Created `Copy-AzureBlob` function:
+  - Takes source and destination blob paths
+  - Uses `Start-AzStorageBlobCopy` to initiate copy within same container
+  - Waits for copy operation to complete
+  - Returns success/failure status
+  - Suppresses progress bars to avoid flashing output
+- Created `Remove-AzureBlob` function:
+  - Deletes a blob from Azure Storage
+  - Returns success/failure status
+  - Suppresses progress bars
+- Modified `Move-SPOFileWithPDF` function:
+  - Stores Azure blob path when checking for PDF existence
+  - After successfully moving PDF in SharePoint, calculates destination blob path
+  - Copies blob to new location if source blob exists
+  - Optionally deletes old blob if `-DeleteOldAzureBlobs` is specified
+  - Provides clear console output for each Azure operation
+- Updated startup logic to display deletion mode warning
+- Updated documentation with new parameter and examples
+
+**Benefits:**
+- Keeps Azure Storage synchronized with SharePoint when moving files
+- Optional deletion prevents blob accumulation in old locations
+- Non-intrusive: Azure operations only happen if CheckAzure is configured
+- Clear feedback showing Azure copy/delete operations
+
+**Example Usage:**
+```powershell
+# Move files and copy Azure blobs (keep old blobs)
+.\Move-SPOFiles.ps1 -MoveFile "Reference/old/*.docx" -Destination "Reference/new" -CheckAzure ".\azure-config.json"
+
+# Move files and copy Azure blobs, deleting old blobs
+.\Move-SPOFiles.ps1 -MoveFile "Reference/old/*.docx" -Destination "Reference/new" -CheckAzure ".\azure-config.json" -DeleteOldAzureBlobs
+```
+
+**Safety Features:**
+- Blob copy completes before deletion attempt
+- Copy failure prevents deletion
+- Detailed verbose logging for troubleshooting
+- Warning message displayed when deletion mode is active
+
+---
+
 ## Current Feature Set
 
 The script now includes:
@@ -161,6 +216,9 @@ The script now includes:
 - ✅ Flexible path mapping for SharePoint-to-Azure translation
 - ✅ Graceful degradation if Az.Storage module unavailable
 - ✅ Detailed verbose logging for Azure operations
+- ✅ Azure blob copying when moving PDF files
+- ✅ Optional old blob deletion with `-DeleteOldAzureBlobs`
+- ✅ Single Azure Storage context reused for all operations
 
 ### Usability
 - ✅ List mode to preview files without moving

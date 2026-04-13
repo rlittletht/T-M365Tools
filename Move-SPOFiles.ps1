@@ -53,6 +53,7 @@
 .PARAMETER CheckAzure
     Path to a JSON configuration file for checking Azure Storage for mirrored PDF files.
     When provided, the script will also check if PDF files exist in Azure Blob Storage.
+    When moving files, associated PDF blobs will be copied to the new location in Azure.
     The JSON file must have the following structure:
     {
         "StorageAccount": "<storage_account_name>",
@@ -65,6 +66,11 @@
     and PathMappings has ["https://tenant.sharepoint.com/umps", "umps"], 
     the script will check for "umps/Reference/Helmets/PDF/file.pdf" in Azure Storage.
     Requires Az.Storage module and appropriate Azure authentication.
+
+.PARAMETER DeleteOldAzureBlobs
+    When specified with -CheckAzure, this switch will delete the old Azure blob after successfully
+    copying it to the new location. Only applies when actually moving files (not in -Test or -List mode).
+    Use with caution as this permanently removes the old blob.
 
 .PARAMETER Verbose
     Shows detailed output including each PnP.PowerShell command before it's executed.
@@ -118,12 +124,16 @@
     .\Move-SPOFiles.ps1 -MoveFile "Shared Documents/file.docx" -Destination "Archive" -CheckAzure ".\azure-config.json" -Verbose
     Moves a file while checking both SharePoint and Azure Storage for associated PDFs, with verbose output.
 
+.EXAMPLE
+    .\Move-SPOFiles.ps1 -MoveFile "Shared Documents/*Training*.docx" -Destination "Archive" -CheckAzure ".\azure-config.json" -DeleteOldAzureBlobs
+    Moves files and their associated PDFs. When PDFs are moved, copies the Azure blobs to new locations and deletes the old blobs.
+
 .NOTES
     Author: Created for M365 Tools
     Date: February 16, 2026
     Last Updated: April 12, 2026
     Requires: PnP.PowerShell module
-    Optional: Az.Storage module (for Azure blob checking)
+    Optional: Az.Storage module (for Azure blob checking and management)
 #>
 
 [CmdletBinding()]
@@ -147,12 +157,16 @@ param(
     [switch]$Test,
     
     [Parameter(Mandatory=$false)]
-    [string]$CheckAzure
+    [string]$CheckAzure,
+    
+    [Parameter(Mandatory=$false)]
+    [switch]$DeleteOldAzureBlobs
 )
 
 # Script-level variable to store Azure configuration
 $script:AzureConfig = $null
 $script:AzureStorageContext = $null
+$script:DeleteOldAzureBlobs = $false
 
 function Load-AzureConfiguration {
     <#
@@ -232,17 +246,24 @@ function Initialize-AzureStorageContext {
         # Suppress progress bars to avoid flashing output
         $ProgressPreference = 'SilentlyContinue'
         
-        # Try anonymous context first
-        $ctx = New-AzStorageContext -StorageAccountName $storageAccount -Anonymous -ErrorAction SilentlyContinue
-        
-        if ($null -eq $ctx) {
-            # Try authenticated context
-            Write-Verbose "Anonymous context failed, trying authenticated context"
+        # Try authenticated context first (required for write operations like copy/delete)
+        $ctx = $null
+        try {
+            Write-Verbose "Attempting to create authenticated storage context"
             $ctx = New-AzStorageContext -StorageAccountName $storageAccount -UseConnectedAccount -ErrorAction Stop
             Write-Host "[✓] Azure Storage context created (authenticated)" -ForegroundColor Green
+            Write-Verbose "Authenticated context created successfully"
         }
-        else {
-            Write-Host "[✓] Azure Storage context created (anonymous)" -ForegroundColor Green
+        catch {
+            Write-Verbose "Authenticated context failed: $($_.Exception.Message)"
+            # Fall back to anonymous if authenticated fails
+            Write-Verbose "Trying anonymous context as fallback"
+            $ctx = New-AzStorageContext -StorageAccountName $storageAccount -Anonymous -ErrorAction SilentlyContinue
+            
+            if ($null -ne $ctx) {
+                Write-Host "[✓] Azure Storage context created (anonymous - read-only)" -ForegroundColor Green
+                Write-Host "[!] Warning: Anonymous context may not support copy/delete operations" -ForegroundColor Yellow
+            }
         }
         
         $ProgressPreference = 'Continue'
@@ -304,6 +325,112 @@ function Get-AzureBlobPath {
     }
     Write-Verbose "No path mapping found for: $SharePointUrl"
     return $null
+}
+
+function Copy-AzureBlob {
+    <#
+    .SYNOPSIS
+        Copies a blob from one location to another in Azure Storage.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$SourceBlobPath,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$DestinationBlobPath,
+        
+        [Parameter(Mandatory=$true)]
+        [object]$AzureConfig
+    )
+    
+    try {
+        if ($null -eq $script:AzureStorageContext) {
+            Write-Verbose "Azure Storage context not initialized"
+            return $false
+        }
+        
+        $container = $AzureConfig.StorageContainer
+        
+        Write-Verbose "Copying Azure blob: $SourceBlobPath -> $DestinationBlobPath"
+        
+        # Suppress progress bars
+        $ProgressPreference = 'SilentlyContinue'
+        
+        # Check if source blob exists
+        $sourceBlob = Get-AzStorageBlob -Blob $SourceBlobPath -Container $container -Context $script:AzureStorageContext -ErrorAction SilentlyContinue
+        
+        if ($null -eq $sourceBlob) {
+            Write-Verbose "Source blob not found: $SourceBlobPath"
+            $ProgressPreference = 'Continue'
+            return $false
+        }
+        
+        # Start the copy operation
+        $copyResult = Start-AzStorageBlobCopy -SrcBlob $SourceBlobPath -SrcContainer $container -DestBlob $DestinationBlobPath -DestContainer $container -Context $script:AzureStorageContext -ErrorAction Stop
+        
+        # Wait for copy to complete
+        $copyStatus = $copyResult | Get-AzStorageBlobCopyState
+        while ($copyStatus.Status -eq 'Pending') {
+            Start-Sleep -Milliseconds 500
+            $copyStatus = Get-AzStorageBlob -Blob $DestinationBlobPath -Container $container -Context $script:AzureStorageContext | Get-AzStorageBlobCopyState
+        }
+        
+        $ProgressPreference = 'Continue'
+        
+        if ($copyStatus.Status -eq 'Success') {
+            Write-Verbose "Azure blob copied successfully"
+            return $true
+        }
+        else {
+            Write-Verbose "Azure blob copy failed with status: $($copyStatus.Status)"
+            return $false
+        }
+    }
+    catch {
+        $ProgressPreference = 'Continue'
+        Write-Verbose "Error copying Azure blob: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Remove-AzureBlob {
+    <#
+    .SYNOPSIS
+        Deletes a blob from Azure Storage.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$BlobPath,
+        
+        [Parameter(Mandatory=$true)]
+        [object]$AzureConfig
+    )
+    
+    try {
+        if ($null -eq $script:AzureStorageContext) {
+            Write-Verbose "Azure Storage context not initialized"
+            return $false
+        }
+        
+        $container = $AzureConfig.StorageContainer
+        
+        Write-Verbose "Deleting Azure blob: $BlobPath"
+        
+        # Suppress progress bars
+        $ProgressPreference = 'SilentlyContinue'
+        
+        $result = Remove-AzStorageBlob -Blob $BlobPath -Container $container -Context $script:AzureStorageContext -ErrorAction Stop
+        
+        $ProgressPreference = 'Continue'
+        
+        Write-Verbose "Azure blob deleted successfully"
+        return $true
+    }
+    catch {
+        $ProgressPreference = 'Continue'
+        Write-Verbose "Error deleting Azure blob: $($_.Exception.Message)"
+        return $false
+    }
 }
 
 function Test-AzureBlobExists {
@@ -757,6 +884,7 @@ function Move-SPOFileWithPDF {
         
         # Check Azure storage if configured
         $hasAzurePDF = $false
+        $azureBlobPath = $null
         if ($null -ne $script:AzureConfig) {
             # Get the connection to build the full SharePoint URL
             try {
@@ -773,7 +901,7 @@ function Move-SPOFileWithPDF {
                 
                 if ($null -ne $azureBlobPath) {
                     Write-Verbose "Checking Azure for PDF at: $azureBlobPath"
-                    $hasAzurePDF = Test-AzureBlobExists -BlobPath $azureBlobPath -AzureConfig $script:AzureConfig -ShowWarnings 
+                    $hasAzurePDF = Test-AzureBlobExists -BlobPath $azureBlobPath -AzureConfig $script:AzureConfig -ShowWarnings
                     
                     if ($hasAzurePDF) {
                         Write-Host "    [✓] Found associated PDF in Azure: $azureBlobPath" -ForegroundColor Gray
@@ -827,6 +955,50 @@ function Move-SPOFileWithPDF {
             Write-Verbose "Executing: Move-PnPFile -SourceUrl '$pdfPath' -TargetUrl '$pdfDestFolder/$baseName.pdf' -Force"
             Move-PnPFile -SourceUrl $pdfPath -TargetUrl "$pdfDestFolder/$baseName.pdf" -Force -ErrorAction Stop
             Write-Host "    [✓] PDF moved successfully" -ForegroundColor Green
+            
+            # Copy Azure blob if it exists
+            if ($hasAzurePDF -and $null -ne $azureBlobPath) {
+                try {
+                    # Build the destination blob path
+                    $connection = Get-PnPConnection -ErrorAction Stop
+                    $uri = [System.Uri]$connection.Url
+                    $baseUrl = "$($uri.Scheme)://$($uri.Host)"
+                    $destPdfPath = "$pdfDestFolder/$baseName.pdf"
+                    $fullDestPdfUrl = "$baseUrl$destPdfPath"
+                    
+                    $destAzureBlobPath = Get-AzureBlobPath -SharePointUrl $fullDestPdfUrl -AzureConfig $script:AzureConfig
+                    
+                    if ($null -ne $destAzureBlobPath) {
+                        Write-Host "    [→] Copying Azure blob to: $destAzureBlobPath" -ForegroundColor Gray
+                        $copySuccess = Copy-AzureBlob -SourceBlobPath $azureBlobPath -DestinationBlobPath $destAzureBlobPath -AzureConfig $script:AzureConfig
+                        
+                        if ($copySuccess) {
+                            Write-Host "    [✓] Azure blob copied successfully" -ForegroundColor Green
+                            
+                            # Delete old blob if requested
+                            if ($script:DeleteOldAzureBlobs) {
+                                Write-Verbose "DeleteOldAzureBlobs is TRUE - proceeding with deletion"
+                                Write-Host "    [→] Deleting old Azure blob: $azureBlobPath" -ForegroundColor Gray
+                                $deleteSuccess = Remove-AzureBlob -BlobPath $azureBlobPath -AzureConfig $script:AzureConfig
+                                
+                                if ($deleteSuccess) {
+                                    Write-Host "    [✓] Old Azure blob deleted" -ForegroundColor Green
+                                }
+                                else {
+                                    Write-Host "    [!] Failed to delete old Azure blob" -ForegroundColor Yellow
+                                }
+                            }
+                        }
+                        else {
+                            Write-Host "    [!] Failed to copy Azure blob" -ForegroundColor Yellow
+                        }
+                    }
+                }
+                catch {
+                    Write-Host "    [!] Error managing Azure blob: $($_.Exception.Message)" -ForegroundColor Yellow
+                    Write-Verbose "Azure blob management error: $($_.Exception.Message)"
+                }
+            }
         }
         
         # Move the main file
@@ -1165,28 +1337,70 @@ function Invoke-MoveFiles {
 if ($CheckAzure) {
     Write-Host "`n=== Loading Azure Configuration ===" -ForegroundColor Cyan
     $script:AzureConfig = Load-AzureConfiguration -ConfigPath $CheckAzure
+    $script:DeleteOldAzureBlobs = $PSBoundParameters.ContainsKey('DeleteOldAzureBlobs')
+    Write-Verbose "DeleteOldAzureBlobs switch value: $($script:DeleteOldAzureBlobs)"
     
     if ($null -eq $script:AzureConfig) {
         Write-Host "[X] Failed to load Azure configuration. Azure blob checking will be disabled." -ForegroundColor Yellow
     }
     else {
-        # Initialize Azure Storage context once
-        $script:AzureStorageContext = Initialize-AzureStorageContext -AzureConfig $script:AzureConfig
-        
-        if ($null -eq $script:AzureStorageContext) {
-            Write-Host "[X] Failed to initialize Azure Storage context. Azure blob checking will be disabled." -ForegroundColor Yellow
-            $script:AzureConfig = $null
-        }
-        else {
-            # Check for Azure authentication status (informational)
+        # Check if Azure authentication is required (for MoveFile operations that need write access)
+        # Skip authentication only for -List mode (read-only)
+        if ($MoveFile -and -not $List) {
+            Write-Verbose "MoveFile mode detected - checking Azure authentication for write operations"
+            
             try {
                 $azContext = Get-AzContext -ErrorAction SilentlyContinue
-                if ($null -ne $azContext) {
+                
+                if ($null -eq $azContext -or $null -eq $azContext.Account) {
+                    Write-Host "[!] Azure authentication required for blob copy/delete operations" -ForegroundColor Yellow
+                    Write-Host "[→] Running Connect-AzAccount..." -ForegroundColor Cyan
+                    
+                    # Suppress progress preference during connection
+                    $savedProgress = $ProgressPreference
+                    $ProgressPreference = 'SilentlyContinue'
+                    
+                    try {
+                        # Suppress warnings during authentication
+                        Connect-AzAccount -ErrorAction Stop -WarningAction SilentlyContinue | Out-Null
+                        $azContext = Get-AzContext -ErrorAction Stop
+                        Write-Host "[✓] Azure authenticated as: $($azContext.Account)" -ForegroundColor Green
+                    }
+                    catch {
+                        Write-Host "[X] Failed to authenticate to Azure: $($_.Exception.Message)" -ForegroundColor Red
+                        Write-Host "[!] Azure blob operations will be disabled" -ForegroundColor Yellow
+                        $script:AzureConfig = $null
+                    }
+                    finally {
+                        $ProgressPreference = $savedProgress
+                    }
+                }
+                else {
                     Write-Host "[✓] Azure authenticated as: $($azContext.Account)" -ForegroundColor Green
                 }
             }
             catch {
-                Write-Verbose "Could not check Azure authentication status"
+                Write-Verbose "Could not check Azure authentication status: $($_.Exception.Message)"
+            }
+        }
+        else {
+            Write-Verbose "List mode detected - skipping Azure authentication (anonymous context will be used for checking)"
+        }
+        
+        # Initialize Azure Storage context once (only if config still valid)
+        if ($null -ne $script:AzureConfig) {
+            $script:AzureStorageContext = Initialize-AzureStorageContext -AzureConfig $script:AzureConfig
+            
+            if ($null -eq $script:AzureStorageContext) {
+                Write-Host "[X] Failed to initialize Azure Storage context. Azure blob checking will be disabled." -ForegroundColor Yellow
+                $script:AzureConfig = $null
+            }
+            else {
+                # Display blob deletion mode
+                Write-Verbose "Checking deletion mode: DeleteOldAzureBlobs = $($script:DeleteOldAzureBlobs)"
+                if ($script:DeleteOldAzureBlobs) {
+                    Write-Host "[!] Old Azure blobs will be deleted after copying" -ForegroundColor Yellow
+                }
             }
         }
     }
