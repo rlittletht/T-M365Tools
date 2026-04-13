@@ -53,9 +53,9 @@ function Get-URLsFromHTML {
     
     # Match href attributes in anchor tags
     $hrefPattern = 'href=["'']([^"'']+)["'']'
-    $matches = [regex]::Matches($HTML, $hrefPattern)
+    $hrefMatches = [regex]::Matches($HTML, $hrefPattern)
     
-    foreach ($match in $matches) {
+    foreach ($match in $hrefMatches) {
         if ($match.Groups.Count -gt 1) {
             $urls += $match.Groups[1].Value
         }
