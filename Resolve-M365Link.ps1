@@ -911,6 +911,7 @@ try {
                     WebUrl = $response.webUrl
                     Name = $response.name
                     Status = "Success"
+                    LinkStatus = if ($usedCache) { "Valid (SharePoint Resolved) (cached)" } else { "Valid (SharePoint Resolved)" }
                 }
             }
             elseif ($isCsvMode) {
@@ -920,6 +921,7 @@ try {
                     WebUrl = $response.webUrl
                     Name = $response.name
                     Status = "Success"
+                    LinkStatus = if ($usedCache) { "Valid (SharePoint Resolved) (cached)" } else { "Valid (SharePoint Resolved)" }
                 }
             }
             
@@ -993,6 +995,7 @@ try {
                     WebUrl = "ERROR"
                     Name = "N/A"
                     Status = "Failed: $($_.Exception.Message)"
+                    LinkStatus = "Failed (SharePoint cannot resolve)"
                 }
             }
             elseif ($isCsvMode) {
@@ -1001,6 +1004,7 @@ try {
                     WebUrl = "ERROR"
                     Name = "N/A"
                     Status = "Failed: $($_.Exception.Message)"
+                    LinkStatus = "Failed (SharePoint cannot resolve)"
                 }
             }
         }
@@ -1073,8 +1077,8 @@ try {
                             $newRow | Add-Member -MemberType NoteProperty -Name $prop.Name -Value $resultRow.Status
                         }
                         elseif ($prop.Name -eq "Link Status") {
-                            # Update existing Link Status column (if VerifyAllLinks is used)
-                            if ($VerifyAllLinks -and $resultRow.PSObject.Properties.Name -contains "LinkStatus") {
+                            # Update existing Link Status column - use from result
+                            if ($resultRow.PSObject.Properties.Name -contains "LinkStatus") {
                                 $newRow | Add-Member -MemberType NoteProperty -Name $prop.Name -Value $resultRow.LinkStatus
                             }
                             else {
@@ -1097,13 +1101,13 @@ try {
                     if (-not $hasStatus) {
                         $newRow | Add-Member -MemberType NoteProperty -Name "Status" -Value $resultRow.Status
                     }
-                    if (-not $hasLinkStatus -and $VerifyAllLinks) {
-                        # Add Link Status column if VerifyAllLinks is enabled
+                    if (-not $hasLinkStatus) {
+                        # Add Link Status column - includes both resolved and verified links
                         if ($resultRow.PSObject.Properties.Name -contains "LinkStatus") {
                             $newRow | Add-Member -MemberType NoteProperty -Name "Link Status" -Value $resultRow.LinkStatus
                         }
                         else {
-                            # For resolved links, leave Link Status empty
+                            # Shouldn't happen, but provide empty value as fallback
                             $newRow | Add-Member -MemberType NoteProperty -Name "Link Status" -Value ""
                         }
                     }
