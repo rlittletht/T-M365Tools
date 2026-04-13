@@ -1,0 +1,10 @@
+{
+    "StorageAccount": "your_storage_account_name",
+    "StorageContainer": "your_container_name",
+    "PathMappings": [
+        [
+            "https://yourtenant.sharepoint.com/sitename",
+            "sitename"
+        ]
+    ]
+}

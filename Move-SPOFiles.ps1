@@ -50,6 +50,22 @@
     When used with -Destination, shows where files would be moved to.
     When used without -Destination, simply lists the matching files (same as omitting -Destination).
 
+.PARAMETER CheckAzure
+    Path to a JSON configuration file for checking Azure Storage for mirrored PDF files.
+    When provided, the script will also check if PDF files exist in Azure Blob Storage.
+    The JSON file must have the following structure:
+    {
+        "StorageAccount": "<storage_account_name>",
+        "StorageContainer": "<container_name>",
+        "PathMappings": [
+            [ "SPO_Path_Substring", "Azure_Path_Replacement" ]
+        ]
+    }
+    Example: If a SharePoint URL is "https://tenant.sharepoint.com/umps/Reference/Helmets/PDF/file.pdf"
+    and PathMappings has ["https://tenant.sharepoint.com/umps", "umps"], 
+    the script will check for "umps/Reference/Helmets/PDF/file.pdf" in Azure Storage.
+    Requires Az.Storage module and appropriate Azure authentication.
+
 .PARAMETER Verbose
     Shows detailed output including each PnP.PowerShell command before it's executed.
     This is useful for troubleshooting and understanding what operations the script is performing.
@@ -94,10 +110,20 @@
     .\Move-SPOFiles.ps1 -MoveFile "Shared Documents/file.docx" -Destination "Shared Documents/Archive" -Verbose
     Moves a file with verbose output showing each PnP.PowerShell command being executed.
 
+.EXAMPLE
+    .\Move-SPOFiles.ps1 -List "Shared Documents/*Training*.docx" -CheckAzure ".\azure-config.json"
+    Lists all matching files and checks for associated PDFs in both SharePoint and Azure Storage.
+
+.EXAMPLE
+    .\Move-SPOFiles.ps1 -MoveFile "Shared Documents/file.docx" -Destination "Archive" -CheckAzure ".\azure-config.json" -Verbose
+    Moves a file while checking both SharePoint and Azure Storage for associated PDFs, with verbose output.
+
 .NOTES
     Author: Created for M365 Tools
     Date: February 16, 2026
+    Last Updated: April 12, 2026
     Requires: PnP.PowerShell module
+    Optional: Az.Storage module (for Azure blob checking)
 #>
 
 [CmdletBinding()]
@@ -118,8 +144,240 @@ param(
     [string]$List,
     
     [Parameter(Mandatory=$false)]
-    [switch]$Test
+    [switch]$Test,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$CheckAzure
 )
+
+# Script-level variable to store Azure configuration
+$script:AzureConfig = $null
+$script:AzureStorageContext = $null
+
+function Load-AzureConfiguration {
+    <#
+    .SYNOPSIS
+        Loads Azure storage configuration from JSON file.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$ConfigPath
+    )
+    
+    try {
+        if (-not (Test-Path $ConfigPath)) {
+            Write-Host "[X] Azure configuration file not found: $ConfigPath" -ForegroundColor Red
+            return $null
+        }
+        
+        $configContent = Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json
+        
+        # Validate required properties
+        if (-not $configContent.StorageAccount) {
+            Write-Host "[X] Azure configuration missing 'StorageAccount' property" -ForegroundColor Red
+            return $null
+        }
+        
+        if (-not $configContent.StorageContainer) {
+            Write-Host "[X] Azure configuration missing 'StorageContainer' property" -ForegroundColor Red
+            return $null
+        }
+        
+        if (-not $configContent.PathMappings) {
+            Write-Host "[X] Azure configuration missing 'PathMappings' property" -ForegroundColor Red
+            return $null
+        }
+        
+        Write-Host "[✓] Azure configuration loaded successfully" -ForegroundColor Green
+        Write-Host "    Storage Account: $($configContent.StorageAccount)" -ForegroundColor Gray
+        Write-Host "    Container: $($configContent.StorageContainer)" -ForegroundColor Gray
+        Write-Host "    Path Mappings: $($configContent.PathMappings.Count) mapping(s)" -ForegroundColor Gray
+        
+        return $configContent
+    }
+    catch {
+        Write-Host "[X] Error loading Azure configuration: $($_.Exception.Message)" -ForegroundColor Red
+        return $null
+    }
+}
+
+function Initialize-AzureStorageContext {
+    <#
+    .SYNOPSIS
+        Creates and caches an Azure Storage context for reuse.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [object]$AzureConfig
+    )
+    
+    try {
+        # Check if Az.Storage module is available
+        $azStorageModule = Get-Module -ListAvailable -Name Az.Storage
+        if (-not $azStorageModule) {
+            Write-Host "[!] Az.Storage module not installed. Run: Install-Module Az.Storage" -ForegroundColor Yellow
+            return $null
+        }
+        
+        # Import the module if not already imported
+        if (-not (Get-Module -Name Az.Storage)) {
+            Write-Verbose "Importing Az.Storage module..."
+            Import-Module Az.Storage -ErrorAction SilentlyContinue
+        }
+        
+        $storageAccount = $AzureConfig.StorageAccount
+        
+        Write-Verbose "Creating storage context for account: $storageAccount"
+        
+        # Suppress progress bars to avoid flashing output
+        $ProgressPreference = 'SilentlyContinue'
+        
+        # Try anonymous context first
+        $ctx = New-AzStorageContext -StorageAccountName $storageAccount -Anonymous -ErrorAction SilentlyContinue
+        
+        if ($null -eq $ctx) {
+            # Try authenticated context
+            Write-Verbose "Anonymous context failed, trying authenticated context"
+            $ctx = New-AzStorageContext -StorageAccountName $storageAccount -UseConnectedAccount -ErrorAction Stop
+            Write-Host "[✓] Azure Storage context created (authenticated)" -ForegroundColor Green
+        }
+        else {
+            Write-Host "[✓] Azure Storage context created (anonymous)" -ForegroundColor Green
+        }
+        
+        $ProgressPreference = 'Continue'
+        
+        return $ctx
+    }
+    catch {
+        Write-Host "[X] Failed to create Azure Storage context: $($_.Exception.Message)" -ForegroundColor Red
+        return $null
+    }
+}
+
+function Get-AzureBlobPath {
+    <#
+    .SYNOPSIS
+        Converts a SharePoint URL to an Azure blob path using path mappings.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$SharePointUrl,
+        
+        [Parameter(Mandatory=$true)]
+        [object]$AzureConfig,
+        
+        [Parameter(Mandatory=$false)]
+        [switch]$ShowDiagnostics
+    )
+    
+    if ($ShowDiagnostics) {
+        Write-Host "      [Azure] Mapping URL: $SharePointUrl" -ForegroundColor DarkGray
+    }
+    
+    # Try each path mapping
+    foreach ($mapping in $AzureConfig.PathMappings) {
+        $spoPath = $mapping[0]
+        $azurePath = $mapping[1]
+        
+        if ($ShowDiagnostics) {
+            Write-Host "      [Azure] Testing mapping: '$spoPath' -> '$azurePath'" -ForegroundColor DarkGray
+        }
+        
+        if ($SharePointUrl -like "*$spoPath*") {
+            # Extract the part after the SPO path
+            $urlParts = $SharePointUrl -split [regex]::Escape($spoPath), 2
+            if ($urlParts.Count -eq 2) {
+                $relativePath = $urlParts[1].TrimStart('/')
+                $blobPath = "$azurePath/$relativePath"
+                if ($ShowDiagnostics) {
+                    Write-Host "      [Azure] ✓ Matched! Blob path: $blobPath" -ForegroundColor DarkGray
+                }
+                Write-Verbose "Mapped SharePoint URL to Azure blob: $blobPath"
+                return $blobPath
+            }
+        }
+    }
+    
+    if ($ShowDiagnostics) {
+        Write-Host "      [Azure] ✗ No mapping matched" -ForegroundColor DarkGray
+    }
+    Write-Verbose "No path mapping found for: $SharePointUrl"
+    return $null
+}
+
+function Test-AzureBlobExists {
+    <#
+    .SYNOPSIS
+        Checks if a blob exists in Azure Storage using cached context.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$BlobPath,
+        
+        [Parameter(Mandatory=$true)]
+        [object]$AzureConfig,
+        
+        [Parameter(Mandatory=$false)]
+        [switch]$ShowWarnings,
+        
+        [Parameter(Mandatory=$false)]
+        [switch]$ShowDiagnostics
+    )
+    
+    if ($ShowDiagnostics) {
+        Write-Host "      [Azure] Checking blob: $BlobPath" -ForegroundColor DarkGray
+    }
+    
+    try {
+        # Use cached context if available
+        if ($null -eq $script:AzureStorageContext) {
+            if ($ShowWarnings) {
+                Write-Host "    [!] Azure Storage context not initialized" -ForegroundColor Yellow
+            }
+            Write-Verbose "Azure Storage context is null"
+            return $false
+        }
+        
+        $container = $AzureConfig.StorageContainer
+        
+        if ($ShowDiagnostics) {
+            Write-Host "      [Azure] Querying container '$container'..." -ForegroundColor DarkGray
+        }
+        
+        Write-Verbose "Checking Azure blob: $BlobPath in container: $container"
+        
+        # Suppress progress bars to avoid flashing output
+        $ProgressPreference = 'SilentlyContinue'
+        $blob = Get-AzStorageBlob -Blob $BlobPath -Container $container -Context $script:AzureStorageContext -ErrorAction SilentlyContinue
+        $ProgressPreference = 'Continue'
+        
+        if ($null -ne $blob) {
+            if ($ShowDiagnostics) {
+                Write-Host "      [Azure] ✓ Blob exists!" -ForegroundColor DarkGray
+            }
+            Write-Verbose "Blob exists in Azure: $BlobPath"
+            return $true
+        }
+        else {
+            if ($ShowDiagnostics) {
+                Write-Host "      [Azure] ✗ Blob not found" -ForegroundColor DarkGray
+            }
+            Write-Verbose "Blob not found in Azure: $BlobPath"
+            return $false
+        }
+    }
+    catch {
+        if ($ShowWarnings) {
+            Write-Host "    [!] Azure error: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+        if ($ShowDiagnostics) {
+            Write-Host "      [Azure] ✗ Error: $($_.Exception.Message)" -ForegroundColor DarkGray
+        }
+        Write-Verbose "Error checking Azure blob: $($_.Exception.Message)"
+        return $false
+    }
+}
 
 function Test-PnPModule {
     <#
@@ -490,11 +748,45 @@ function Move-SPOFileWithPDF {
             $pdfFile = Get-PnPFile -Url $pdfPath -ErrorAction SilentlyContinue
             if ($null -ne $pdfFile) {
                 $hasPDF = $true
-                Write-Host "    [✓] Found associated PDF: $pdfPath" -ForegroundColor Gray
+                Write-Host "    [✓] Found associated PDF in SharePoint: $pdfPath" -ForegroundColor Gray
             }
         }
         catch {
             # PDF doesn't exist, that's okay
+        }
+        
+        # Check Azure storage if configured
+        $hasAzurePDF = $false
+        if ($null -ne $script:AzureConfig) {
+            # Get the connection to build the full SharePoint URL
+            try {
+                $connection = Get-PnPConnection -ErrorAction Stop
+                # Get base URL (protocol://domain) without site path
+                $uri = [System.Uri]$connection.Url
+                $baseUrl = "$($uri.Scheme)://$($uri.Host)"
+                $fullPdfUrl = "$baseUrl$pdfPath"
+                
+                Write-Verbose "Full PDF URL for Azure mapping: $fullPdfUrl"
+                
+                # Get the Azure blob path
+                $azureBlobPath = Get-AzureBlobPath -SharePointUrl $fullPdfUrl -AzureConfig $script:AzureConfig 
+                
+                if ($null -ne $azureBlobPath) {
+                    Write-Verbose "Checking Azure for PDF at: $azureBlobPath"
+                    $hasAzurePDF = Test-AzureBlobExists -BlobPath $azureBlobPath -AzureConfig $script:AzureConfig -ShowWarnings 
+                    
+                    if ($hasAzurePDF) {
+                        Write-Host "    [✓] Found associated PDF in Azure: $azureBlobPath" -ForegroundColor Gray
+                    }
+                }
+                else {
+                    Write-Verbose "No Azure path mapping matched for: $fullPdfUrl"
+                }
+            }
+            catch {
+                Write-Host "    [!] Azure check error: $($_.Exception.Message)" -ForegroundColor Yellow
+                Write-Verbose "Error checking Azure storage: $($_.Exception.Message)"
+            }
         }
         
         # If in list mode, just show what would be moved
@@ -687,10 +979,42 @@ function Invoke-MoveFiles {
                             Write-Verbose "Executing: Get-PnPFile -Url '$pdfPath'"
                             $pdfFile = Get-PnPFile -Url $pdfPath -ErrorAction SilentlyContinue
                             if ($null -ne $pdfFile) {
-                                Write-Host "    [✓] Has associated PDF: $pdfPath" -ForegroundColor Gray
+                                Write-Host "    [✓] Has associated PDF in SharePoint: $pdfPath" -ForegroundColor Gray
                             }
                         }
                         catch { }
+                        
+                        # Check Azure storage if configured
+                        if ($null -ne $script:AzureConfig) {
+                            try {
+                                $connection = Get-PnPConnection -ErrorAction Stop
+                                # Get base URL (protocol://domain) without site path
+                                $uri = [System.Uri]$connection.Url
+                                $baseUrl = "$($uri.Scheme)://$($uri.Host)"
+                                $fullPdfUrl = "$baseUrl$pdfPath"
+                                
+                                Write-Verbose "Full PDF URL for Azure mapping: $fullPdfUrl"
+                                
+                                # Get the Azure blob path
+                                $azureBlobPath = Get-AzureBlobPath -SharePointUrl $fullPdfUrl -AzureConfig $script:AzureConfig 
+                                
+                                if ($null -ne $azureBlobPath) {
+                                    Write-Verbose "Checking Azure for PDF at: $azureBlobPath"
+                                    $hasAzurePDF = Test-AzureBlobExists -BlobPath $azureBlobPath -AzureConfig $script:AzureConfig -ShowWarnings 
+                                    
+                                    if ($hasAzurePDF) {
+                                        Write-Host "    [✓] Has associated PDF in Azure: $azureBlobPath" -ForegroundColor Gray
+                                    }
+                                }
+                                else {
+                                    Write-Verbose "No Azure path mapping matched for: $fullPdfUrl"
+                                }
+                            }
+                            catch {
+                                Write-Host "    [!] Azure check error: $($_.Exception.Message)" -ForegroundColor Yellow
+                                Write-Verbose "Error checking Azure storage: $($_.Exception.Message)"
+                            }
+                        }
                     }
                     $successCount++
                 }
@@ -769,10 +1093,42 @@ function Invoke-MoveFiles {
                         Write-Verbose "Executing: Get-PnPFile -Url '$pdfPath'"
                         $pdfFile = Get-PnPFile -Url $pdfPath -ErrorAction SilentlyContinue
                         if ($null -ne $pdfFile) {
-                            Write-Host "    [✓] Has associated PDF: $pdfPath" -ForegroundColor Gray
+                            Write-Host "    [✓] Has associated PDF in SharePoint: $pdfPath" -ForegroundColor Gray
                         }
                     }
                     catch { }
+                    
+                    # Check Azure storage if configured
+                    if ($null -ne $script:AzureConfig) {
+                        try {
+                            $connection = Get-PnPConnection -ErrorAction Stop
+                            # Get base URL (protocol://domain) without site path
+                            $uri = [System.Uri]$connection.Url
+                            $baseUrl = "$($uri.Scheme)://$($uri.Host)"
+                            $fullPdfUrl = "$baseUrl$pdfPath"
+                            
+                            Write-Verbose "Full PDF URL for Azure mapping: $fullPdfUrl"
+                            
+                            # Get the Azure blob path
+                            $azureBlobPath = Get-AzureBlobPath -SharePointUrl $fullPdfUrl -AzureConfig $script:AzureConfig
+                            
+                            if ($null -ne $azureBlobPath) {
+                                Write-Verbose "Checking Azure for PDF at: $azureBlobPath"
+                                $hasAzurePDF = Test-AzureBlobExists -BlobPath $azureBlobPath -AzureConfig $script:AzureConfig -ShowWarnings 
+                                
+                                if ($hasAzurePDF) {
+                                    Write-Host "    [✓] Has associated PDF in Azure: $azureBlobPath" -ForegroundColor Gray
+                                }
+                            }
+                            else {
+                                Write-Verbose "No Azure path mapping matched for: $fullPdfUrl"
+                            }
+                        }
+                        catch {
+                            Write-Host "    [!] Azure check error: $($_.Exception.Message)" -ForegroundColor Yellow
+                            Write-Verbose "Error checking Azure storage: $($_.Exception.Message)"
+                        }
+                    }
                 }
                 Write-Host ""
                 Write-Host "[✓] File found" -ForegroundColor Green
@@ -804,6 +1160,37 @@ function Invoke-MoveFiles {
 }
 
 # Main script logic
+
+# Load Azure configuration if provided
+if ($CheckAzure) {
+    Write-Host "`n=== Loading Azure Configuration ===" -ForegroundColor Cyan
+    $script:AzureConfig = Load-AzureConfiguration -ConfigPath $CheckAzure
+    
+    if ($null -eq $script:AzureConfig) {
+        Write-Host "[X] Failed to load Azure configuration. Azure blob checking will be disabled." -ForegroundColor Yellow
+    }
+    else {
+        # Initialize Azure Storage context once
+        $script:AzureStorageContext = Initialize-AzureStorageContext -AzureConfig $script:AzureConfig
+        
+        if ($null -eq $script:AzureStorageContext) {
+            Write-Host "[X] Failed to initialize Azure Storage context. Azure blob checking will be disabled." -ForegroundColor Yellow
+            $script:AzureConfig = $null
+        }
+        else {
+            # Check for Azure authentication status (informational)
+            try {
+                $azContext = Get-AzContext -ErrorAction SilentlyContinue
+                if ($null -ne $azContext) {
+                    Write-Host "[✓] Azure authenticated as: $($azContext.Account)" -ForegroundColor Green
+                }
+            }
+            catch {
+                Write-Verbose "Could not check Azure authentication status"
+            }
+        }
+    }
+}
 
 # Handle -Connect first if provided
 if ($Connect) {
