@@ -33,6 +33,16 @@
     - Full URL: 'https://contoso.sharepoint.com/mysite'
     This parameter is processed first, allowing you to combine it with other actions like -Check or -MoveFile.
 
+.PARAMETER DeviceLogin
+    Uses device code authentication instead of interactive browser authentication when connecting.
+    This is useful when the default browser launches with the wrong profile because you can open
+    the device login URL in the exact browser/profile you want.
+
+.PARAMETER Tenant
+    Optional tenant identifier for authentication. This is most useful with -DeviceLogin when
+    PnP.PowerShell asks you to specify a tenant. Accepts tenant ID (GUID) or hostname
+    (for example, 'contoso.onmicrosoft.com' or 'contoso.sharepoint.com').
+
 .PARAMETER MoveFile
     The source file or pattern to move. Must include the folder path.
     Examples: "Shared Documents/file.docx" or "Shared Documents/*Training*.docx"
@@ -93,6 +103,14 @@
     Connects to the specified SharePoint site URL using interactive authentication.
 
 .EXAMPLE
+    .\Move-SPOFiles.ps1 -Connect "contoso/mysite" -DeviceLogin
+    Connects using device code authentication so you can complete sign-in in your chosen browser profile.
+
+.EXAMPLE
+    .\Move-SPOFiles.ps1 -Connect "contoso/mysite" -DeviceLogin -Tenant "contoso.onmicrosoft.com"
+    Connects using device code authentication and an explicit tenant hostname.
+
+.EXAMPLE
     .\Move-SPOFiles.ps1 -Connect "contoso/mysite" -Check
     Connects to SharePoint first, then verifies the environment setup.
 
@@ -131,7 +149,7 @@
 .NOTES
     Author: Created for M365 Tools
     Date: February 16, 2026
-    Last Updated: April 12, 2026
+    Last Updated: November 13, 2026
     Requires: PnP.PowerShell module
     Optional: Az.Storage module (for Azure blob checking and management)
 #>
@@ -143,6 +161,12 @@ param(
     
     [Parameter(Mandatory=$false)]
     [string]$Connect,
+
+    [Parameter(Mandatory=$false)]
+    [switch]$DeviceLogin,
+
+    [Parameter(Mandatory=$false)]
+    [string]$Tenant,
     
     [Parameter(Mandatory=$false)]
     [string]$MoveFile,
@@ -565,6 +589,7 @@ function Test-PnPConnection {
             Write-Host "`nTo connect to a SharePoint site, run:" -ForegroundColor Yellow
             Write-Host "    Connect-PnPOnline -Url 'https://yourtenant.sharepoint.com/yoursite' -Interactive" -ForegroundColor White
             Write-Host "`nOr use other authentication methods:" -ForegroundColor Yellow
+            Write-Host "    Connect-PnPOnline -Url 'https://yourtenant.sharepoint.com/yoursite' -DeviceLogin" -ForegroundColor White
             Write-Host "    Connect-PnPOnline -Url 'https://yourtenant.sharepoint.com/yoursite' -UseWebLogin" -ForegroundColor White
             return $false
         }
@@ -579,6 +604,7 @@ function Test-PnPConnection {
         Write-Host "`nTo connect to a SharePoint site, run:" -ForegroundColor Yellow
         Write-Host "    Connect-PnPOnline -Url 'https://yourtenant.sharepoint.com/yoursite' -Interactive" -ForegroundColor White
         Write-Host "`nOr use other authentication methods:" -ForegroundColor Yellow
+        Write-Host "    Connect-PnPOnline -Url 'https://yourtenant.sharepoint.com/yoursite' -DeviceLogin" -ForegroundColor White
         Write-Host "    Connect-PnPOnline -Url 'https://yourtenant.sharepoint.com/yoursite' -UseWebLogin" -ForegroundColor White
         return $false
     }
@@ -646,7 +672,13 @@ function Connect-ToPnP {
     #>
     param(
         [Parameter(Mandatory=$true)]
-        [string]$SiteUrl
+        [string]$SiteUrl,
+
+        [Parameter(Mandatory=$false)]
+        [switch]$UseDeviceLogin,
+
+        [Parameter(Mandatory=$false)]
+        [string]$Tenant
     )
     
     Write-Host "`n=== Connecting to SharePoint ===" -ForegroundColor Cyan
@@ -659,9 +691,30 @@ function Connect-ToPnP {
     }
     
     try {
-        Write-Host "`nAttempting to connect using Interactive authentication..." -ForegroundColor Yellow
-        Write-Verbose "Executing: Connect-PnPOnline -Url '$SiteUrl' -Interactive"
-        Connect-PnPOnline -Url $SiteUrl -Interactive -ErrorAction Stop
+        if ($UseDeviceLogin) {
+            $tenantToUse = $Tenant
+
+            if ([string]::IsNullOrWhiteSpace($tenantToUse)) {
+                try {
+                    $tenantToUse = ([Uri]$SiteUrl).Host
+                }
+                catch {
+                    Write-Host "`n[X] Could not determine tenant from site URL '$SiteUrl'." -ForegroundColor Red
+                    Write-Host "    Please try again with -Tenant '<tenant-id-or-hostname>'." -ForegroundColor Yellow
+                    return $false
+                }
+            }
+
+            Write-Host "`nAttempting to connect using DeviceLogin authentication..." -ForegroundColor Yellow
+            Write-Host "Tenant: $tenantToUse" -ForegroundColor Gray
+            Write-Verbose "Executing: Connect-PnPOnline -Url '$SiteUrl' -DeviceLogin -Tenant '$tenantToUse'"
+            Connect-PnPOnline -Url $SiteUrl -DeviceLogin -Tenant $tenantToUse -ErrorAction Stop
+        }
+        else {
+            Write-Host "`nAttempting to connect using Interactive authentication..." -ForegroundColor Yellow
+            Write-Verbose "Executing: Connect-PnPOnline -Url '$SiteUrl' -Interactive"
+            Connect-PnPOnline -Url $SiteUrl -Interactive -ErrorAction Stop
+        }
         Write-Host "[✓] Successfully connected to SharePoint site!" -ForegroundColor Green
         
         # Verify connection
@@ -689,6 +742,8 @@ function Connect-ToPnP {
             Write-Host "`nTroubleshooting tips:" -ForegroundColor Yellow
             Write-Host "  • Verify the URL is correct and accessible" -ForegroundColor Gray
             Write-Host "  • Ensure you have permissions to access the site" -ForegroundColor Gray
+            Write-Host "  • If browser profile selection is causing sign-in issues, try: Connect-PnPOnline -Url '$SiteUrl' -DeviceLogin" -ForegroundColor Gray
+            Write-Host "  • If prompted for tenant, retry with: -Tenant '<tenant-id-or-hostname>'" -ForegroundColor Gray
             Write-Host "  • Try using -UseWebLogin instead: Connect-PnPOnline -Url '$SiteUrl' -UseWebLogin" -ForegroundColor Gray
         }
         
@@ -1442,7 +1497,7 @@ if ($Connect) {
         exit 1
     }
     
-    $result = Connect-ToPnP -SiteUrl $siteUrl
+    $result = Connect-ToPnP -SiteUrl $siteUrl -UseDeviceLogin:$DeviceLogin -Tenant $Tenant
     
     if (-not $result) {
         exit 1
@@ -1509,6 +1564,8 @@ elseif (-not $Connect) {
     Write-Host "No action specified. Available options:" -ForegroundColor Yellow
     Write-Host "  -Check                    Verify environment setup" -ForegroundColor Gray
     Write-Host "  -Connect <tenant|tenant/site|url>   Connect to a SharePoint site" -ForegroundColor Gray
+    Write-Host "  -DeviceLogin              Use device code login (use with -Connect)" -ForegroundColor Gray
+    Write-Host "  -Tenant <tenantId|hostname>   Optional auth tenant (especially with -DeviceLogin)" -ForegroundColor Gray
     Write-Host "  -List <pattern>           List files matching pattern" -ForegroundColor Gray
     Write-Host "  -MoveFile <src> -Destination <dest>   Move file(s) to destination" -ForegroundColor Gray
     Write-Host "  -MoveFile <src> -Destination <dest> -Test   Preview files that would be moved (dry run)" -ForegroundColor Gray
@@ -1516,6 +1573,8 @@ elseif (-not $Connect) {
     Write-Host "`nExamples:" -ForegroundColor Cyan
     Write-Host "  .\Move-SPOFiles.ps1 -Check" -ForegroundColor White
     Write-Host "  .\Move-SPOFiles.ps1 -Connect 'contoso'" -ForegroundColor White
+    Write-Host "  .\Move-SPOFiles.ps1 -Connect 'contoso' -DeviceLogin" -ForegroundColor White
+    Write-Host "  .\Move-SPOFiles.ps1 -Connect 'contoso' -DeviceLogin -Tenant 'contoso.onmicrosoft.com'" -ForegroundColor White
     Write-Host "  .\Move-SPOFiles.ps1 -Connect 'contoso/mysite'" -ForegroundColor White
     Write-Host "  .\Move-SPOFiles.ps1 -Connect 'https://contoso.sharepoint.com/mysite'" -ForegroundColor White
     Write-Host "  .\Move-SPOFiles.ps1 -Connect 'contoso/mysite' -Check" -ForegroundColor White
